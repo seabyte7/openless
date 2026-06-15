@@ -54,8 +54,9 @@ use crate::selection::capture_selection;
 #[cfg(target_os = "windows")]
 use crate::types::PasteShortcut;
 use crate::types::{
-    CapsulePayload, CapsuleState, ChineseScriptPreference, DictationSession, HotkeyCapability,
-    HotkeyStatus, HotkeyStatusState, InsertStatus, OutputLanguagePreference, PolishMode,
+    CapsulePayload, CapsuleProcessingStage, CapsuleState, ChineseScriptPreference,
+    DictationSession, HotkeyCapability, HotkeyStatus, HotkeyStatusState, InsertStatus,
+    OutputLanguagePreference, PolishMode,
 };
 #[cfg(target_os = "windows")]
 use crate::windows_ime_ipc::ImeSubmitTarget;
@@ -6696,6 +6697,30 @@ fn emit_capsule(
     message: Option<String>,
     inserted_chars: Option<u32>,
 ) {
+    emit_capsule_with_processing(
+        inner,
+        state,
+        level,
+        elapsed_ms,
+        message,
+        inserted_chars,
+        None,
+        None,
+        None,
+    );
+}
+
+fn emit_capsule_with_processing(
+    inner: &Arc<Inner>,
+    state: CapsuleState,
+    level: f32,
+    elapsed_ms: u64,
+    message: Option<String>,
+    inserted_chars: Option<u32>,
+    processing_stage: Option<CapsuleProcessingStage>,
+    asr_elapsed_ms: Option<u64>,
+    llm_elapsed_ms: Option<u64>,
+) {
     // 在 app 句柄校验之前记录，便于无 GUI 的测试断言「按下热键 → 弹了哪种胶囊」。
     *inner.last_capsule_state.lock() = Some(state);
     let app_opt = inner.app.lock().clone();
@@ -6710,6 +6735,9 @@ fn emit_capsule(
         inserted_chars,
         translation,
         operating,
+        processing_stage,
+        asr_elapsed_ms,
+        llm_elapsed_ms,
     };
 
     #[cfg(target_os = "android")]

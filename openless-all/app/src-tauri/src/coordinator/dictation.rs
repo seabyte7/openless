@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::coordinator_state::request_stop_during_starting_state;
 use crate::correction::apply_correction_rules;
+use crate::types::CapsuleProcessingStage;
 use crate::types::HotkeyMode;
 
 use super::qa::handle_qa_option_edge;
@@ -1601,7 +1602,18 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     };
 
     let elapsed = inner.state.lock().started_at.elapsed().as_millis() as u64;
-    emit_capsule(inner, CapsuleState::Transcribing, 0.0, elapsed, None, None);
+    let asr_started = std::time::Instant::now();
+    emit_capsule_with_processing(
+        inner,
+        CapsuleState::Transcribing,
+        0.0,
+        elapsed,
+        None,
+        None,
+        Some(CapsuleProcessingStage::Asr),
+        Some(0),
+        None,
+    );
 
     if let Some(rec) = take_recorder_for_session(inner, current_session_id) {
         rec.stop();
@@ -2004,6 +2016,19 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         }
     };
 
+    let asr_elapsed_ms = asr_started.elapsed().as_millis() as u64;
+    emit_capsule_with_processing(
+        inner,
+        CapsuleState::Transcribing,
+        0.0,
+        elapsed,
+        None,
+        None,
+        Some(CapsuleProcessingStage::Asr),
+        Some(asr_elapsed_ms),
+        None,
+    );
+
     // ASR 完成后 cancel 检查：用户在 transcribe 进行中按 Esc 时，这里就会命中。
     // 优先级高于 empty 检查 — 用户取消 → 静默丢弃，不写失败历史也不弹错误胶囊。
     if inner.state.lock().cancelled {
@@ -2105,8 +2130,6 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             .await;
     }
 
-    emit_capsule(inner, CapsuleState::Polishing, 0.0, elapsed, None, None);
-
     let prefs = inner.prefs.get();
     let pack = match inner
         .style_packs
@@ -2131,6 +2154,7 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     let translation_target = prefs.translation_target_language.trim().to_string();
     let translation_active =
         inner.translation_modifier_seen.load(Ordering::SeqCst) && !translation_target.is_empty();
+    let uses_llm = translation_active || mode != PolishMode::Raw || raw_uses_llm;
     log::info!(
         "[style-pack] runtime dispatch session_id={} active_pack={} kind={:?} mode={:?} raw_chars={} prompt_chars={} raw_uses_llm={} translation_active={} hotwords={} working_languages={:?}",
         current_session_id,
@@ -2181,6 +2205,19 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
 
     // Linux: emit_capsule(Polishing) 已通过 fcitx5 auxDown 显示 "✨ 润色中..."，
     // 无需在此重复调用。
+
+    emit_capsule_with_processing(
+        inner,
+        CapsuleState::Polishing,
+        0.0,
+        elapsed,
+        None,
+        None,
+        Some(CapsuleProcessingStage::Llm),
+        Some(asr_elapsed_ms),
+        if uses_llm { Some(0) } else { None },
+    );
+    let llm_started = std::time::Instant::now();
 
     // 翻译会话润色后的源语言文本（译文前的中间产物），仅翻译路径解析成功时有值，
     // 写进 history 供后续普通润色轮复用（剔除译文、避免外语污染）。
@@ -2238,6 +2275,22 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         .await;
         (p, e, false)
     };
+    let llm_elapsed_ms = if uses_llm {
+        Some(llm_started.elapsed().as_millis() as u64)
+    } else {
+        None
+    };
+    emit_capsule_with_processing(
+        inner,
+        CapsuleState::Polishing,
+        0.0,
+        elapsed,
+        None,
+        None,
+        Some(CapsuleProcessingStage::Llm),
+        Some(asr_elapsed_ms),
+        llm_elapsed_ms,
+    );
 
     let polished = finalize_polished_text(
         polished,

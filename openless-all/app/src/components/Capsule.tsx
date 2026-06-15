@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { useTranslation } from 'react-i18next';
 import { detectOS, type OS } from './WindowChrome';
 import {
@@ -181,14 +181,32 @@ interface PillProps {
   insertedChars: number;
   message?: string;
   operating?: boolean;
+  processingStage: CapsulePayload['processingStage'];
+  asrElapsedMs: number | null;
+  llmElapsedMs: number | null;
   onCancel: () => void;
   onConfirm: () => void;
 }
 
-function Pill({ os, state, level, insertedChars, message, operating, onCancel, onConfirm }: PillProps) {
+function formatProcessingTime(ms: number): string {
+  return `${(Math.max(0, ms) / 1000).toFixed(1)}s`;
+}
+
+function Pill({
+  os,
+  state,
+  level,
+  insertedChars,
+  message,
+  operating,
+  processingStage,
+  asrElapsedMs,
+  llmElapsedMs,
+  onCancel,
+  onConfirm,
+}: PillProps) {
   const { t } = useTranslation();
   const metrics = getCapsulePillMetrics(os);
-  const processingLayout = getCapsuleMessageLayout(os, 'processing');
   const cancelEnabled = state === 'recording' || state === 'transcribing' || state === 'polishing';
   const confirmEnabled = state === 'recording';
 
@@ -206,6 +224,27 @@ function Pill({ os, state, level, insertedChars, message, operating, onCancel, o
     return undefined;
   }, [state]);
 
+  const processingStageStartedAt = useRef<number>(performance.now());
+  const [processingTick, setProcessingTick] = useState(0);
+  useEffect(() => {
+    if (state !== 'transcribing' && state !== 'polishing') return undefined;
+    processingStageStartedAt.current = performance.now();
+    setProcessingTick(tick => tick + 1);
+    const timer = window.setInterval(() => {
+      setProcessingTick(tick => tick + 1);
+    }, 100);
+    return () => window.clearInterval(timer);
+  }, [state, processingStage, asrElapsedMs, llmElapsedMs]);
+
+  const liveElapsedMs = processingTick >= 0
+    ? performance.now() - processingStageStartedAt.current
+    : 0;
+  const visibleAsrMs =
+    processingStage === 'asr' && asrElapsedMs === 0 ? liveElapsedMs : asrElapsedMs;
+  const visibleLlmMs =
+    processingStage === 'llm' && llmElapsedMs === 0 ? liveElapsedMs : llmElapsedMs;
+  const processingWidth = os === 'win' ? 106 : 96;
+
   let center: JSX.Element;
   switch (state) {
     case 'recording':
@@ -218,10 +257,9 @@ function Pill({ os, state, level, insertedChars, message, operating, onCancel, o
           style={{
             display: 'inline-flex',
             alignItems: 'center',
-            // 左右 4px 内边距 + 外层 gap 已经让 "thinking" ↔ ✗/✓ 视觉间距落在 ~4-5px。
-            padding: '0 4px',
+            padding: '0 1px',
             width: '100%',
-            maxWidth: metrics.textWidth,
+            maxWidth: processingWidth,
             minWidth: 0,
             justifyContent: 'center',
             // state 进入动画 —— 用户从 recording 切到 polishing 时多一道淡入提示，
@@ -229,15 +267,20 @@ function Pill({ os, state, level, insertedChars, message, operating, onCancel, o
             animation: 'cap-state-enter 220ms var(--ol-motion-soft) both',
           }}
         >
+          <span style={processingTimeStyle}>
+            {visibleAsrMs == null ? '' : formatProcessingTime(visibleAsrMs)}
+          </span>
           <span
             style={{
               // v1.3.1-7 用户拍板：黑色底字 + 蓝色扫光（亮黄太显眼，黑底更稳）。
-              // 字号保持 17，字重 700 → 600 稍细一些。
-              fontSize: 17,
+              // 左右加入 ASR/LLM 时间后，处理中间文案使用小字号保住胶囊宽度。
+              fontSize: 10.3,
               fontWeight: 600,
-              letterSpacing: 0.3,
+              letterSpacing: 0,
               // line-height: 1 下 g/y/p 等下伸字符会被 clip，给 padding 留 descender 空间。
               paddingBlock: 1,
+              width: 40,
+              flexShrink: 0,
               color: 'var(--ol-ink-2)',
               backgroundImage:
                 'linear-gradient(100deg, var(--ol-ink) 0%, var(--ol-ink) 35%, var(--ol-blue) 50%, var(--ol-ink) 65%, var(--ol-ink) 100%)',
@@ -248,18 +291,23 @@ function Pill({ os, state, level, insertedChars, message, operating, onCancel, o
               // 进入流式的头 ~2 秒用 0.9s 高速扫光（视觉提示「刚开始」），之后 React 副作用
               // 切到 2.4s 慢速。duration 变化时浏览器不重启动画，会平滑减速。
               animation: `cap-shine ${shineFast ? '0.9s' : '2.4s'} linear infinite`,
-              minWidth: 0,
               textAlign: 'center',
-              lineHeight: processingLayout.allowWrap ? 1.3 : 1.25,
-              whiteSpace: processingLayout.allowWrap ? 'normal' : 'nowrap',
+              lineHeight: 1.1,
+              whiteSpace: 'nowrap',
               overflow: 'hidden',
               textOverflow: 'ellipsis',
-              display: '-webkit-box',
-              WebkitBoxOrient: 'vertical',
-              WebkitLineClamp: processingLayout.lineClamp,
+              display: 'inline-block',
             }}
           >
             {t(operating ? 'capsule.using' : 'capsule.thinking')}
+          </span>
+          <span
+            style={{
+              ...processingTimeStyle,
+              visibility: visibleLlmMs == null ? 'hidden' : 'visible',
+            }}
+          >
+            {visibleLlmMs == null ? '0.0s' : formatProcessingTime(visibleLlmMs)}
           </span>
         </div>
       );
@@ -315,6 +363,18 @@ function Pill({ os, state, level, insertedChars, message, operating, onCancel, o
   );
 }
 
+const processingTimeStyle: CSSProperties = {
+  width: 27,
+  flexShrink: 0,
+  fontSize: 9.3,
+  fontWeight: 600,
+  color: 'var(--ol-ink-3)',
+  fontVariantNumeric: 'tabular-nums',
+  lineHeight: 1,
+  textAlign: 'center',
+  whiteSpace: 'nowrap',
+};
+
 // 与 @keyframes capsule-out 的 0.36s 时长一致——必须同步，否则定时器先于
 // 动画结束就 unmount → 用户看到半截动画被截断。
 // v1.3.1-6: 从 240ms 加到 360ms 让用户看清退出动画（240ms 太快感知不到）。
@@ -336,6 +396,9 @@ export function Capsule() {
   const [message, setMessage] = useState<string | undefined>();
   const [translation, setTranslation] = useState<boolean>(false);
   const [operating, setOperating] = useState<boolean>(false);
+  const [processingStage, setProcessingStage] = useState<CapsulePayload['processingStage']>(null);
+  const [asrElapsedMs, setAsrElapsedMs] = useState<number | null>(null);
+  const [llmElapsedMs, setLlmElapsedMs] = useState<number | null>(null);
   // `leaving` 与 `lastVisibleState` 协同实现「退出动画」：
   // - 当 state 从非 idle 变成 idle 时，不立即卸载，而是把 leaving 置为 true 并保留
   //   最后一帧的可见 state（lastVisibleState），让胶囊用 capsule-out 动画收缩淡出。
@@ -366,6 +429,9 @@ export function Capsule() {
         if (p.insertedChars != null) setInsertedChars(p.insertedChars);
         setTranslation(p.translation === true);
         setOperating(p.operating === true);
+        setProcessingStage(p.processingStage ?? null);
+        setAsrElapsedMs(p.asrElapsedMs ?? null);
+        setLlmElapsedMs(p.llmElapsedMs ?? null);
       });
       if (cancelled) handle();
       else unlisten = handle;
@@ -504,6 +570,9 @@ export function Capsule() {
         insertedChars={insertedChars}
         message={message}
         operating={operating}
+        processingStage={processingStage}
+        asrElapsedMs={asrElapsedMs}
+        llmElapsedMs={llmElapsedMs}
         onCancel={onCancel}
         onConfirm={onConfirm}
       />

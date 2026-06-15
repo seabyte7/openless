@@ -506,6 +506,9 @@ export interface CapsulePayload {
   translation: boolean;
   /** 当前是否是 Less Computer 会话：处理态文案显示 "using" 而非 "thinking"。 */
   operating?: boolean;
+  processingStage: 'asr' | 'llm' | null;
+  asrElapsedMs: number | null;
+  llmElapsedMs: number | null;
 }
 
 export interface CredentialsStatus {

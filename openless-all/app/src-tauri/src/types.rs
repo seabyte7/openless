@@ -2527,6 +2527,13 @@ pub enum CapsuleState {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CapsuleProcessingStage {
+    Asr,
+    Llm,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CapsulePayload {
@@ -2542,6 +2549,9 @@ pub struct CapsulePayload {
     /// 从 "thinking" 换成 "using"——告诉用户 Agent 正在操作电脑而非单纯思考。
     #[serde(default)]
     pub operating: bool,
+    pub processing_stage: Option<CapsuleProcessingStage>,
+    pub asr_elapsed_ms: Option<u64>,
+    pub llm_elapsed_ms: Option<u64>,
 }
 
 /// Snapshot of credentials read from vault — only what the UI needs to know

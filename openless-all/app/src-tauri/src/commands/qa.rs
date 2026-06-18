@@ -29,6 +29,9 @@ pub fn set_qa_hotkey(
         if let Some(open_app) = prefs.open_app_hotkey.as_ref() {
             reject_qa_open_app_hotkey_overlap(binding, open_app)?;
         }
+        if let Some(less_computer) = prefs.coding_agent_voice_hotkey.as_ref() {
+            reject_qa_less_computer_hotkey_overlap(binding, less_computer)?;
+        }
     }
     prefs.qa_hotkey = binding;
     coord.prefs().set(prefs).map_err(|e| e.to_string())?;
@@ -74,7 +77,19 @@ pub fn less_computer_window_resize(coord: CoordinatorState<'_>, height: f64) {
 }
 
 /// 内联审批卡的 Approve / Deny 回执。token 关联到等待中的拦截动作。
+///
+/// 安全：审批 UI 渲染在 less-computer 窗口（LessComputerPanel），故仅允许该窗口提交，
+/// 拦截 main / capsule / qa / glow 等其它窗口伪造审批 —— 把可调用窗口从 5 个收紧到 1 个。
 #[tauri::command]
-pub fn less_computer_approve(coord: CoordinatorState<'_>, token: String, approved: bool) {
+pub fn less_computer_approve(
+    window: Window,
+    coord: CoordinatorState<'_>,
+    token: String,
+    approved: bool,
+) -> Result<(), String> {
+    if window.label() != "less-computer" {
+        return Err("approval can only be submitted from the Less Computer window".to_string());
+    }
     coord.less_computer_approve(&token, approved);
+    Ok(())
 }

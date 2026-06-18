@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { useTranslation } from 'react-i18next';
 import { detectOS, type OS } from './WindowChrome';
 import {
@@ -130,7 +130,9 @@ interface CircleButtonProps {
   onClick: () => void;
 }
 
-function CircleButton({ variant, enabled, onClick }: CircleButtonProps) {
+// memo:录音时 level 每帧(~60Hz)变化会重渲 Pill;cancel/confirm 两个 SVG 按钮跟
+// level 无关,memo + 稳定的 onClick 让它们在录音期间跳过重渲(只剩音量条真正更新)。
+const CircleButton = memo(function CircleButton({ variant, enabled, onClick }: CircleButtonProps) {
   const { t } = useTranslation();
   const isCancel = variant === 'cancel';
   return (
@@ -172,7 +174,7 @@ function CircleButton({ variant, enabled, onClick }: CircleButtonProps) {
       )}
     </button>
   );
-}
+});
 
 interface PillProps {
   os: OS;
@@ -206,7 +208,7 @@ function Pill({
   onConfirm,
 }: PillProps) {
   const { t } = useTranslation();
-  const metrics = getCapsulePillMetrics(os);
+  const metrics = useMemo(() => getCapsulePillMetrics(os), [os]);
   const cancelEnabled = state === 'recording' || state === 'transcribing' || state === 'polishing';
   const confirmEnabled = state === 'recording';
 
@@ -468,13 +470,13 @@ export function Capsule() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
 
-  const onCancel = () => {
+  const onCancel = useCallback(() => {
     void invokeOrMock<void>('cancel_dictation', undefined, () => undefined);
-  };
+  }, []);
 
-  const onConfirm = () => {
+  const onConfirm = useCallback(() => {
     void invokeOrMock<void>('stop_dictation', undefined, () => undefined);
-  };
+  }, []);
 
   // 真正卸载：state 已是 idle，且不在离场动画中。
   if (state === 'idle' && !leaving) {
@@ -545,8 +547,8 @@ export function Capsule() {
             fontWeight: 600,
             color: 'var(--ol-blue)',
             background: 'var(--ol-capsule-badge-bg)',
-            backdropFilter: 'blur(20px) saturate(180%)',
-            WebkitBackdropFilter: 'blur(20px) saturate(180%)',
+            // issue #470：去掉无效的 backdrop-filter —— webview 模糊不了透明窗口背后的桌面
+            // （Tauri 上游限制，同本文件上方 pill 注释），纯空耗合成，删除零视觉变化。
             border: '0.5px solid var(--ol-capsule-badge-border)',
             boxShadow: '0 4px 12px -4px rgba(37, 99, 235, 0.25), 0 0 0 0.5px rgba(0,0,0,0.04)',
             letterSpacing: '0.02em',

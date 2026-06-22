@@ -889,7 +889,7 @@ export const zhTW: typeof zhCN = {
         '逐字即時插入，降低感知延遲。不滿足條件時回落到一次性貼上。',
       streamingInsertLabel: '流式輸入',
       streamingInsertHintMac:
-        '臨時切到 ABC 輸入源，避免 CJK IME 攔截，會話結束後自動切回。',
+        'macOS 使用剪貼簿貼上，避免切換系統輸入源或打斷中文輸入法狀態。',
       streamingInsertHintWindows:
         'SendInput Unicode 直接送字元，繞過 TSF / IME，不切輸入法。',
       streamingInsertHintLinux:

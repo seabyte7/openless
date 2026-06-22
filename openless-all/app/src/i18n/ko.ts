@@ -891,7 +891,7 @@ export const ko: typeof zhCN = {
         '실시간 글자별 삽입으로 체감 지연 감소. 조건 불충족 시 일괄 붙여넣기로 전환.',
       streamingInsertLabel: '스트리밍 입력',
       streamingInsertHintMac:
-        '스트리밍 중 입력 소스를 ABC 로 임시 전환 (CJK IME 가로채기 방지). 세션 종료 시 자동 복원.',
+        'macOS 에서는 클립보드 붙여넣기를 사용해 입력 소스나 CJK IME 상태를 바꾸지 않습니다.',
       streamingInsertHintWindows:
         'SendInput Unicode 로 TSF / IME 를 우회. 입력 소스 전환 불필요.',
       streamingInsertHintLinux:

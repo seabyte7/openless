@@ -298,20 +298,23 @@ export function RecordingInputSection() {
             />
           </SettingRow>
         )}
-        {/* 流式输入：润色 SSE 一边到达一边模拟键盘逐字落到光标，降低感知延迟。
-            不满足条件时自动回落一次性插入。属于「插入行为」，故归到本组。 */}
-        <SettingRow label={t('settings.advanced.streamingInsertLabel')}>
-          <Toggle
-            on={!!prefs.streamingInsert}
-            onToggle={(next) => void savePrefs({ ...prefs, streamingInsert: next })}
-          />
-        </SettingRow>
-        <SettingRow label={t('settings.advanced.streamingInsertSaveClipboardLabel')}>
-          <Toggle
-            on={!!prefs.streamingInsertSaveClipboard}
-            onToggle={(next) => void savePrefs({ ...prefs, streamingInsertSaveClipboard: next })}
-          />
-        </SettingRow>
+        {/* macOS 使用剪贴板 + Cmd+V，避免流式路径切换系统输入源。Windows 仍保留流式开关。 */}
+        {os === 'win' && (
+          <>
+            <SettingRow label={t('settings.advanced.streamingInsertLabel')}>
+              <Toggle
+                on={!!prefs.streamingInsert}
+                onToggle={(next) => void savePrefs({ ...prefs, streamingInsert: next })}
+              />
+            </SettingRow>
+            <SettingRow label={t('settings.advanced.streamingInsertSaveClipboardLabel')}>
+              <Toggle
+                on={!!prefs.streamingInsertSaveClipboard}
+                onToggle={(next) => void savePrefs({ ...prefs, streamingInsertSaveClipboard: next })}
+              />
+            </SettingRow>
+          </>
+        )}
       </Collapsible>
       )}
       {/* ─── 启动（折叠） ──────────────────────────────────────────── */}

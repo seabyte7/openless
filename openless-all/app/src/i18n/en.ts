@@ -923,7 +923,7 @@ export const en: typeof zhCN = {
         'Streams text to cursor character by character, reducing perceived latency. Falls back to one-shot paste when conditions are not met.',
       streamingInsertLabel: 'Streaming insertion',
       streamingInsertHintMac:
-        'Temporarily switches the input source to ABC so CJK IMEs cannot intercept keystrokes; restored on session end.',
+        'macOS uses clipboard paste so it does not switch input sources or disturb CJK IME state.',
       streamingInsertHintWindows:
         'SendInput Unicode types directly, bypassing TSF / IME — no input-method switching needed.',
       streamingInsertHintLinux:

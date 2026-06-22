@@ -891,7 +891,7 @@ export const ja: typeof zhCN = {
         '逐字リアルタイム挿入で体感遅延を低減。条件不一致時はワンショット貼り付けにフォールバック。',
       streamingInsertLabel: 'ストリーミング入力',
       streamingInsertHintMac:
-        'ストリーミング中は一時的に ABC 入力ソースへ切替（CJK IME による傍受を回避）。セッション終了時に自動で元へ戻ります。',
+        'macOS ではクリップボード貼り付けを使い、入力ソースや CJK IME の状態を切り替えません。',
       streamingInsertHintWindows:
         'SendInput Unicode で TSF / IME を迂回。入力ソースの切替は不要です。',
       streamingInsertHintLinux:

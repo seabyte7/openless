@@ -733,7 +733,7 @@ pub struct UserPreferences {
     /// 的处理时延显著降低（润色 LLM 第一个 token 即开始落字）。
     ///
     /// 平台原语：
-    /// - macOS：CGEvent Unicode FFI；CJK / 日文 IME 会拦截，session 期间临时切到 ABC
+    /// - macOS：主流程禁用流式路径，使用剪贴板 + Cmd+V，避免切换系统输入源
     /// - Windows：SendInput Unicode（绕过 TSF）；不需要切输入法
     /// - Linux：通过 fcitx5 插件 commitString 直写或剪贴板回落。
     ///
@@ -742,9 +742,8 @@ pub struct UserPreferences {
     /// - 仅 OpenAI-compatible provider 实装（v1）；Gemini / Codex provider 走原一次性
     ///   插入路径
     ///
-    /// 默认 true（自 1.3.2-3 起）—— 流式落字感知延迟低，所有 fallback case 都已经接好，
-    /// 让开箱即用就能体验。CJK IME / Codex / Gemini provider 自动回落到一次性路径，
-    /// 用户无感。详见上面「限制」段。
+    /// 默认 true（自 1.3.2-3 起）—— 流式落字感知延迟低，所有 fallback case 都已经接好。
+    /// macOS 会在运行时忽略该开关并走一次性粘贴路径，避免打断中文输入法状态。
     #[serde(default = "default_true")]
     pub streaming_insert: bool,
     /// issue #440 的一次性迁移标记。老版本会把默认 `streamingInsert:false`

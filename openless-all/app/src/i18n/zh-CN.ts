@@ -921,7 +921,7 @@ export const zhCN = {
         '逐字实时插入，降低感知延迟。不满足条件时回落到一次性粘贴。',
       streamingInsertLabel: '流式输入',
       streamingInsertHintMac:
-        '临时切到 ABC 输入源，避免 CJK IME 拦截，会话结束后自动切回。',
+        'macOS 使用剪贴板粘贴，避免切换系统输入源或打断中文输入法状态。',
       streamingInsertHintWindows:
         'SendInput Unicode 直接送字符，绕过 TSF / IME，不切输入法。',
       streamingInsertHintLinux:

@@ -59,15 +59,16 @@ fn emit_less_computer(inner: &Arc<Inner>, payload: serde_json::Value) {
 /// 跑流式润色路径（opt-in，跨平台）。
 ///
 /// 平台差异：
-/// - **macOS**：`switch_to_ascii` 切到 ABC 输入源（规避 CJK / 日文 IME 拦截 Unicode 事件），
-///   session 结束 `restore_input_source` 切回。`type_unicode_chunk` 走 CGEvent FFI。
+/// - **macOS**：这条流式路径保留实验实现，但运行时 gate 默认禁用；主流程走一次性
+///   剪贴板 + Cmd+V，避免切换系统输入源或扰乱 Rime / 鼠须管的中英文状态。
 /// - **Windows**：`switch_to_ascii` 是 no-op（SendInput Unicode 绕过 TSF）；
 ///   `type_unicode_chunk` 走 `SendInput(KEYEVENTF_UNICODE)`。
 /// - **Linux（实验）**：`switch_to_ascii` 是 no-op；`type_unicode_chunk` 走 enigo
 ///   `Keyboard::text`。X11 / XTest 稳定。
 ///
 /// 通用流程：
-/// 1. `switch_to_ascii`（macOS）/ no-op（其他）；失败则降级回一次性 `polish_or_passthrough`。
+/// 1. `switch_to_ascii`（macOS 实验路径）/ no-op（其他）；失败则降级回一次性
+///    `polish_or_passthrough`。
 /// 2. 起一个 `spawn_blocking` 后台任务，从 mpsc 收 SSE delta，按 12ms flush window
 ///    合并后调 `type_unicode_chunk` 模拟键盘事件落到光标处。串行有序，无竞态。
 /// 3. 调 `polish_or_passthrough_streaming`，`on_delta` 把 chunk 塞进 mpsc。
@@ -438,7 +439,20 @@ fn streaming_insert_eligible(
     mode: PolishMode,
     raw_uses_llm: bool,
 ) -> bool {
-    streaming_insert_enabled && !translation_active && (mode != PolishMode::Raw || raw_uses_llm)
+    let eligible =
+        streaming_insert_enabled && !translation_active && (mode != PolishMode::Raw || raw_uses_llm);
+    #[cfg(target_os = "macos")]
+    {
+        // macOS streaming insertion currently switches the system input source to ABC.
+        // Chinese IMEs such as Rime/Squirrel keep their own ascii_mode state, so even a
+        // best-effort restore can leave users in English input. Prefer paste insertion.
+        let _ = eligible;
+        false
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        eligible
+    }
 }
 
 fn default_done_message(status: InsertStatus, polish_failed: bool) -> Option<String> {
@@ -2860,10 +2874,40 @@ mod tests {
 
     #[test]
     fn streaming_insert_eligible_when_gates_allow() {
+        #[cfg(target_os = "macos")]
+        assert!(!streaming_insert_eligible(
+            true,
+            false,
+            PolishMode::Light,
+            false,
+        ));
+        #[cfg(not(target_os = "macos"))]
         assert!(streaming_insert_eligible(
             true,
             false,
             PolishMode::Light,
+            false,
+        ));
+    }
+
+    #[test]
+    fn streaming_insert_eligible_respects_common_gates() {
+        assert!(!streaming_insert_eligible(
+            false,
+            false,
+            PolishMode::Light,
+            false,
+        ));
+        assert!(!streaming_insert_eligible(
+            true,
+            true,
+            PolishMode::Light,
+            false,
+        ));
+        assert!(!streaming_insert_eligible(
+            true,
+            false,
+            PolishMode::Raw,
             false,
         ));
     }

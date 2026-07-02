@@ -81,6 +81,9 @@ export type HotkeyTrigger =
   | 'rightControl'
   | 'leftControl'
   | 'rightCommand'
+  | 'leftCommand'
+  | 'leftShift'
+  | 'rightShift'
   | 'fn'
   | 'rightAlt'
   | 'mediaPlayPause'
@@ -125,9 +128,9 @@ export interface HotkeyStatus {
 }
 
 export interface ShortcutBinding {
-  /** 主键，例如 "D" / "Space" / "F1" / "RightOption" / "Shift" */
+  /** 主键，例如 "D" / "Space" / "F1" / "RightOption" / "LeftShift" */
   primary: string;
-  /** 修饰符列表，元素小写："cmd" | "shift" | "alt" | "ctrl"。 */
+  /** 修饰符：泛化 tag（cmd/ctrl/…）或侧别 tag（cmd-left/ctrl-right/…）。 */
   modifiers: string[];
 }
 
@@ -150,6 +153,12 @@ export type CodingAgentPermissionMode =
  *  - shiftInsert : xterm / urxvt 等老派 X11 终端
  *  详见 issue #360。 */
 export type PasteShortcut = 'ctrlV' | 'ctrlShiftV' | 'shiftInsert';
+
+/** Windows 听写文本插入策略。 */
+export type WindowsInsertionMode = 'tsf' | 'sendInput' | 'paste';
+
+/** Windows SendInput 路径的换行模拟方式。 */
+export type WindowsSendInputNewlineMode = 'enter' | 'shiftEnter' | 'crlf';
 
 export type WindowsImeInstallState =
   | 'installed'
@@ -268,6 +277,14 @@ export interface UserPreferences {
   pasteShortcut: PasteShortcut;
   /** Windows：TSF 失败后是否允许快捷键粘贴 / 剪贴板兜底。仅在剪贴板写失败时才再试 SendInput。关闭后可验证是否真实 TSF 上屏。 */
   allowNonTsfInsertionFallback: boolean;
+  /** Windows：听写插入策略（TSF / SendInput / 剪贴板粘贴）。 */
+  windowsInsertionMode: WindowsInsertionMode;
+  /** Windows SendInput 路径的换行模拟方式。 */
+  windowsSendInputNewlineMode: WindowsSendInputNewlineMode;
+  /** 旧版兼容：`true` 等价于 `windowsInsertionMode === 'sendInput'`。 */
+  windowsSendInputInsertionOnly: boolean;
+  /** Windows：SendInput 模式下是否在系统键盘列表（Win+Space）中显示 OpenLess。 */
+  windowsShowOpenlessInKeyboardList: boolean;
   /** 用户的工作语言（多选，原生名）；作为前提注入 LLM polish/translate prompt 头部。 */
   workingLanguages: string[];
   /** 翻译模式目标语言（单选，原生名）；空串 = 不启用 Shift 翻译。详见 issue #4。 */
@@ -298,6 +315,8 @@ export interface UserPreferences {
   codingAgentPermissionMode: CodingAgentPermissionMode;
   /** Agent 工作目录，null = 临时目录。 */
   codingAgentWorkdir: string | null;
+  /** Agent 可执行文件路径/命令，null 或空 = 按后端取默认（claude / opencode）。 */
+  codingAgentExe: string | null;
   /** Less Computer 按住说话快捷键。null = 停用；目前仅 macOS 显示/生效。 */
   codingAgentVoiceHotkey: ShortcutBinding | null;
   /** 热键 1：语音 Agent 面板键。null = 停用。 */

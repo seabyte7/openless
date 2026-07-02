@@ -282,6 +282,7 @@ struct Inner {
     /// 自定义组合键监听器（global-hotkey crate）。当 `prefs.hotkey.trigger == Custom` 时
     /// 代替 modifier-only 的 hotkey monitor。`None` 表示不使用自定义组合键或还没成功安装。
     combo_hotkey: Mutex<Option<ComboHotkeyMonitor>>,
+    side_aware_combo: Mutex<Option<crate::side_aware_combo::SideAwareComboMonitor>>,
     translation_hotkey: Mutex<Option<ComboHotkeyMonitor>>,
     switch_style_hotkey: Mutex<Option<ComboHotkeyMonitor>>,
     open_app_hotkey: Mutex<Option<ComboHotkeyMonitor>>,
@@ -403,6 +404,7 @@ impl Coordinator {
                     session_cooldown_until: Mutex::new(None),
                     shortcut_recording_active: AtomicBool::new(false),
                     combo_hotkey: Mutex::new(None),
+                    side_aware_combo: Mutex::new(None),
                     translation_hotkey: Mutex::new(None),
                     switch_style_hotkey: Mutex::new(None),
                     open_app_hotkey: Mutex::new(None),
@@ -495,6 +497,7 @@ impl Coordinator {
                 session_cooldown_until: Mutex::new(None),
                 shortcut_recording_active: AtomicBool::new(false),
                 combo_hotkey: Mutex::new(None),
+                side_aware_combo: Mutex::new(None),
                 translation_hotkey: Mutex::new(None),
                 switch_style_hotkey: Mutex::new(None),
                 open_app_hotkey: Mutex::new(None),
@@ -810,18 +813,41 @@ impl Coordinator {
     pub fn update_combo_hotkey_binding(&self) {
         let prefs = self.inner.prefs.get();
         if crate::shortcut_binding::legacy_modifier_trigger(&prefs.dictation_hotkey).is_some() {
-            // 修饰键单键由 HotkeyMonitor 处理，组合键 monitor 要释放。
             take_combo_hotkey_on_main_thread(&self.inner);
+            self.inner.side_aware_combo.lock().take();
             log::info!("[coord] combo hotkey 已关闭（modifier-only）");
             return;
         }
         let binding = prefs.dictation_hotkey.clone();
         if is_unconfigured_shortcut(&binding) {
-            // Custom 但没录到有效主键：清掉旧 monitor，避免旧快捷键继续生效。
             take_combo_hotkey_on_main_thread(&self.inner);
+            self.inner.side_aware_combo.lock().take();
             log::info!("[coord] combo hotkey 已关闭（无绑定）");
             return;
-        };
+        }
+
+        if crate::shortcut_binding::binding_requires_side_aware_hook(&binding) {
+            take_combo_hotkey_on_main_thread(&self.inner);
+            self.inner.side_aware_combo.lock().take();
+            let (tx, rx) = mpsc::channel::<ComboHotkeyEvent>();
+            match crate::side_aware_combo::SideAwareComboMonitor::start(binding, tx) {
+                Ok(monitor) => {
+                    *self.inner.side_aware_combo.lock() = Some(monitor);
+                    let bridge_inner = Arc::clone(&self.inner);
+                    std::thread::Builder::new()
+                        .name("openless-side-combo-bridge".into())
+                        .spawn(move || combo_hotkey_bridge_loop(bridge_inner, rx))
+                        .ok();
+                    log::info!("[coord] side-aware combo hotkey listener installed (via update)");
+                }
+                Err(e) => {
+                    log::warn!("[coord] update side-aware combo binding 失败: {e}");
+                }
+            }
+            return;
+        }
+
+        self.inner.side_aware_combo.lock().take();
         let app = self.inner.app.lock().clone();
         let Some(app) = app else {
             log::warn!("[coord] update combo hotkey binding: AppHandle 未 bind，跳过");
@@ -1752,14 +1778,20 @@ fn should_try_non_tsf_insertion_fallback(
 }
 
 #[cfg(target_os = "windows")]
-fn insert_via_non_tsf_fallback(
+pub(super) fn insert_via_non_tsf_fallback(
     inner: &Arc<Inner>,
     polished: &str,
     _restore_clipboard: bool,
     _paste_shortcut: PasteShortcut,
 ) -> InsertStatus {
+    let prefs = inner.prefs.get();
+    let sendinput_options = crate::unicode_keystroke::WindowsSendInputOptions {
+        newline_mode: prefs.windows_sendinput_newline_mode,
+    };
     let status = finish_non_tsf_insertion_fallback(
-        || inner.inserter.insert_via_unicode_keystrokes(polished),
+        || inner
+            .inserter
+            .insert_via_unicode_keystrokes(polished, sendinput_options),
         || inner.inserter.copy_fallback(polished),
     );
 
@@ -2003,7 +2035,8 @@ fn build_active_llm_provider(llm_thinking_enabled: bool) -> anyhow::Result<Activ
         .trim_end_matches('/')
         .to_string();
     let config = OpenAICompatibleConfig::new(active, "OpenLess LLM", base_url, api_key, model)
-        .with_thinking_enabled(llm_thinking_enabled);
+        .with_thinking_enabled(llm_thinking_enabled)
+        .with_extra_headers(CredentialsVault::get_active_llm_extra_headers());
     Ok(ActiveLLMProvider::OpenAI(OpenAICompatibleLLMProvider::new(
         config,
     )))
@@ -2028,6 +2061,7 @@ fn resolve_ark_endpoint_with_policy(
 #[cfg(test)]
 mod tests {
     use super::dictation::abort_recording_with_error;
+    use super::dictation::{handle_pressed_edge, handle_released_edge};
     use super::*;
     use crate::types::{HotkeyMode, HotkeyTrigger};
     use once_cell::sync::Lazy;
@@ -2767,7 +2801,13 @@ mod tests {
     #[test]
     fn focus_restore_failure_uses_specific_error_code_when_insert_fails() {
         assert_eq!(
-            dictation_error_code(InsertStatus::Failed, false, false, false),
+            dictation_error_code(
+                InsertStatus::Failed,
+                false,
+                false,
+                false,
+                crate::types::WindowsInsertionMode::Tsf,
+            ),
             Some("focusRestoreFailed")
         );
     }
@@ -2784,8 +2824,28 @@ mod tests {
     #[cfg(target_os = "windows")]
     fn tsf_required_failure_keeps_tsf_error_when_focus_was_ready() {
         assert_eq!(
-            dictation_error_code(InsertStatus::Failed, false, true, false),
+            dictation_error_code(
+                InsertStatus::Failed,
+                false,
+                true,
+                false,
+                crate::types::WindowsInsertionMode::Tsf,
+            ),
             Some("windowsImeTsfRequired")
+        );
+    }
+
+    #[test]
+    fn sendinput_only_mode_skips_tsf_required_error() {
+        assert_eq!(
+            dictation_error_code(
+                InsertStatus::Failed,
+                false,
+                true,
+                false,
+                crate::types::WindowsInsertionMode::SendInput,
+            ),
+            None
         );
     }
 

@@ -89,6 +89,7 @@ export {
     openSystemSettings,
     triggerMicrophonePrompt,
     restartApp,
+    resetAccessibilityPermissionAndRestartApp,
 } from "./permissions"
 
 // hotkeys
@@ -161,10 +162,12 @@ export type {
 export type {
     McpServerStatus,
     ClaudeDetection,
+    OpenCodeDetection,
     CodingAgentRunTestArgs,
 } from "./coding-agent"
 export {
     codingAgentDetect,
+    codingAgentDetectOpencode,
     codingAgentRunTest,
     codingAgentCancelTest,
     codingAgentCommandRisk,

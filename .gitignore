@@ -82,7 +82,6 @@ docs/plans/
 
 # 根目录 AI 协作指南
 /CLAUDE.md
-/AGENTS.md
 /issue-*-plan.md
 
 # .github 内部协作 + 审计报告（ISSUE_TEMPLATE / workflows / pr template 仍保留发布）

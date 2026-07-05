@@ -147,6 +147,14 @@ impl LocalQwenAsr {
         self.engine_cache
     }
 
+    pub fn path_label(&self) -> &'static str {
+        if self.mode.live_session_id().is_some() {
+            "live"
+        } else {
+            "batch_stream"
+        }
+    }
+
     /// 当前缓冲音频时长（毫秒）。Coordinator 在 transcribe() 调用前读取，
     /// 用来给本地 Qwen ASR 计算动态超时。不消费缓冲。
     pub fn buffer_duration_ms(&self) -> u64 {

@@ -2456,6 +2456,21 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn local_qwen_dictation_mode_uses_live_except_voice_agent() {
+        let sid = session_id(7);
+
+        assert_eq!(
+            local_qwen_session_mode_for_dictation(sid, false),
+            crate::asr::local::LocalQwenSessionMode::DictationLive { session_id: sid }
+        );
+        assert_eq!(
+            local_qwen_session_mode_for_dictation(sid, true),
+            crate::asr::local::LocalQwenSessionMode::BatchOnly
+        );
+    }
+
     #[test]
     fn whisper_timeout_floors_at_global_timeout_for_short_audio() {
         // 10s 录音：10 × 0.5 = 5, +20 = 25, max(30) = 30。短音频兜底。

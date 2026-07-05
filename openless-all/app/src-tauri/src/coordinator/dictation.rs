@@ -1438,7 +1438,7 @@ pub(super) async fn begin_session_as(
     if let Some(provider) = macos_keyless_dictation_provider(&active_asr) {
         match provider {
             MacosKeylessDictationProvider::LocalQwen3 => {
-                let local = match build_local_qwen3(inner).await {
+                let local = match build_local_qwen3_for_dictation(inner, current_session_id).await {
                     Ok(l) => l,
                     Err(e) => {
                         log::error!("[coord] 本地 Qwen3-ASR 初始化失败: {e:#}");
@@ -2376,6 +2376,7 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             let timeout_duration = local_qwen_transcribe_timeout(audio_secs);
             let model_id = local.model_id().to_string();
             let engine_cache = local.engine_cache().as_str();
+            let path_label = local.path_label();
             log::info!(
                 "[coord] local Qwen3-ASR transcribe: audio={:.2}s timeout={}s",
                 audio_secs,
@@ -2392,10 +2393,11 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                 Err(_) => "timeout",
             };
             log::info!(
-                "[local-asr fast] session={} provider=local-qwen3 model={} engine_cache={} path=batch_stream audio_ms={} recording_stop_ms={} stop_to_raw_ms={} total_asr_ms={} timeout_ms={} fallback=none fallback_engine=none status={}",
+                "[local-asr fast] session={} provider=local-qwen3 model={} engine_cache={} path={} audio_ms={} recording_stop_ms={} stop_to_raw_ms={} total_asr_ms={} timeout_ms={} fallback=none fallback_engine=none status={}",
                 current_session_id,
                 model_id,
                 engine_cache,
+                path_label,
                 audio_ms,
                 recording_stop_elapsed_ms,
                 stop_to_raw_ms,

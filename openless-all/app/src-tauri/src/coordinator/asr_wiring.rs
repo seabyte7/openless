@@ -277,8 +277,21 @@ pub(super) fn schedule_sherpa_onnx_release(inner: &Arc<Inner>, session: AsrRelea
 }
 
 #[cfg(target_os = "macos")]
-pub(super) async fn build_local_qwen3(
+pub(super) fn local_qwen_session_mode_for_dictation(
+    session_id: SessionId,
+    voice_agent: bool,
+) -> crate::asr::local::LocalQwenSessionMode {
+    if voice_agent {
+        crate::asr::local::LocalQwenSessionMode::BatchOnly
+    } else {
+        crate::asr::local::LocalQwenSessionMode::DictationLive { session_id }
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn build_local_qwen3_with_mode(
     inner: &Arc<Inner>,
+    mode: crate::asr::local::LocalQwenSessionMode,
 ) -> anyhow::Result<Arc<crate::asr::local::LocalQwenAsr>> {
     let prefs = inner.prefs.get();
     let model_id = crate::asr::local::ModelId::from_str(&prefs.local_asr_active_model)
@@ -314,8 +327,25 @@ pub(super) async fn build_local_qwen3(
         model_id.as_str().to_string(),
         model_dir,
         loaded.outcome,
-        crate::asr::local::LocalQwenSessionMode::BatchOnly,
+        mode,
     )))
+}
+
+#[cfg(target_os = "macos")]
+pub(super) async fn build_local_qwen3(
+    inner: &Arc<Inner>,
+) -> anyhow::Result<Arc<crate::asr::local::LocalQwenAsr>> {
+    build_local_qwen3_with_mode(inner, crate::asr::local::LocalQwenSessionMode::BatchOnly).await
+}
+
+#[cfg(target_os = "macos")]
+pub(super) async fn build_local_qwen3_for_dictation(
+    inner: &Arc<Inner>,
+    session_id: SessionId,
+) -> anyhow::Result<Arc<crate::asr::local::LocalQwenAsr>> {
+    let voice_agent = inner.state.lock().voice_agent;
+    let mode = local_qwen_session_mode_for_dictation(session_id, voice_agent);
+    build_local_qwen3_with_mode(inner, mode).await
 }
 
 #[cfg(target_os = "macos")]

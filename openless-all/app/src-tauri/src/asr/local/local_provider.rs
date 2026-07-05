@@ -10,11 +10,15 @@
 #[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_os = "macos")]
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use std::thread::{self, JoinHandle};
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use anyhow::{Context, Result};
@@ -43,6 +47,10 @@ const BATCH_STREAM_TAIL_SILENCE_SAMPLES: usize = 8_000;
 const LIVE_START_THRESHOLD_MS: u64 = 2_000;
 #[cfg(target_os = "macos")]
 const LIVE_FEEDER_CHANNEL_CAPACITY: usize = 64;
+#[cfg(target_os = "macos")]
+const LIVE_CANCEL_JOIN_GRACE_MS: u64 = 1_000;
+#[cfg(target_os = "macos")]
+const LIVE_PROGRESS_STALL_MS: u64 = 3_000;
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +213,7 @@ impl LocalQwenAsr {
         pcm_bytes: Vec<u8>,
         duration_ms: u64,
     ) -> Result<RawTranscript> {
+        let audio_secs = duration_ms as f64 / 1000.0;
         let stop_action = {
             let mut live = self.live.lock();
             live.machine.on_stop()
@@ -218,27 +227,58 @@ impl LocalQwenAsr {
             LocalQwenStopAction::FinishLive => {
                 let runtime = self.live.lock().take_runtime_for_finalize();
                 let Some(runtime) = runtime else {
-                    self.mark_live_fallback_needed(LocalQwenLiveFallbackReason::LiveWorkerFailed);
-                    anyhow::bail!("local Qwen live path missing runtime; fallback needed");
+                    return self
+                        .transcribe_fallback_final(
+                            pcm_bytes,
+                            duration_ms,
+                            LocalQwenLiveFallbackReason::WorkerJoinError,
+                            LocalQwenFallbackEngine::Cached,
+                        )
+                        .await;
                 };
-                let text =
-                    tauri::async_runtime::spawn_blocking(move || finalize_live_runtime(runtime))
-                        .await
-                        .context("qwen live finalize spawn_blocking join 失败")?
-                        .context("qwen live finalize failed")?;
+                let finish_outcome = tauri::async_runtime::spawn_blocking(move || {
+                    finalize_live_runtime(runtime, audio_secs)
+                })
+                .await
+                .context("qwen live finalize spawn_blocking join 失败")?;
 
-                if text.trim().is_empty() {
-                    self.mark_live_fallback_needed(LocalQwenLiveFallbackReason::EmptyLiveResult);
-                    anyhow::bail!("local Qwen live result empty; fallback needed");
+                match finish_outcome {
+                    LocalQwenLiveFinishOutcome::Final(text) => {
+                        self.live.lock().machine.on_live_final();
+                        self.buffer.lock().clear();
+                        Ok(RawTranscript { text, duration_ms })
+                    }
+                    LocalQwenLiveFinishOutcome::Fallback {
+                        reason,
+                        detail,
+                        engine,
+                    } => {
+                        log::warn!(
+                            "[local-asr fast] provider=local-qwen3 model={} path=live event=fallback_needed reason={} fallback_engine={} detail={}",
+                            self.model_id,
+                            reason.as_str(),
+                            engine.as_str(),
+                            detail
+                        );
+                        self.transcribe_fallback_final(pcm_bytes, duration_ms, reason, engine)
+                            .await
+                    }
                 }
-
-                self.live.lock().machine.on_live_final();
-                self.buffer.lock().clear();
-                Ok(RawTranscript { text, duration_ms })
             }
             LocalQwenStopAction::FallbackNeeded(reason) => {
-                self.live.lock().cancel_runtime();
-                anyhow::bail!("local Qwen live fallback needed: {}", reason.as_str());
+                let runtime = self.live.lock().take_runtime_for_cancel();
+                let (reason, engine) = if let Some(runtime) = runtime {
+                    let cancel_reason = reason;
+                    tauri::async_runtime::spawn_blocking(move || {
+                        cancel_live_runtime_for_fallback(runtime, cancel_reason)
+                    })
+                    .await
+                    .context("qwen live cancel spawn_blocking join 失败")?
+                } else {
+                    (reason, LocalQwenFallbackEngine::Cached)
+                };
+                self.transcribe_fallback_final(pcm_bytes, duration_ms, reason, engine)
+                    .await
             }
             LocalQwenStopAction::Cancelled => {
                 anyhow::bail!("local Qwen live session cancelled");
@@ -253,6 +293,70 @@ impl LocalQwenAsr {
             .await
             .context("qwen direct final spawn_blocking join 失败")?
             .context("qwen direct final failed")
+    }
+
+    async fn transcribe_fallback_final(
+        &self,
+        pcm_bytes: Vec<u8>,
+        duration_ms: u64,
+        reason: LocalQwenLiveFallbackReason,
+        engine: LocalQwenFallbackEngine,
+    ) -> Result<RawTranscript> {
+        let model_id = self.model_id.clone();
+        let model_dir = self.model_dir.clone();
+        let fallback_started = Instant::now();
+        let samples_f32 = i16_le_bytes_to_f32(&pcm_bytes);
+        let engine_for_log = engine.as_str();
+        let reason_for_log = reason.as_str();
+
+        let text_result = match engine {
+            LocalQwenFallbackEngine::Cached => {
+                let engine = Arc::clone(&self.engine);
+                tauri::async_runtime::spawn_blocking(move || {
+                    engine.transcribe_stream_final(&samples_f32)
+                })
+                .await
+                .context("qwen cached fallback spawn_blocking join 失败")?
+            }
+            LocalQwenFallbackEngine::Fresh => tauri::async_runtime::spawn_blocking(move || {
+                let engine = QwenAsrEngine::load(&model_dir)
+                    .context("load fresh qwen engine for fallback")?;
+                engine.transcribe_stream_final(&samples_f32)
+            })
+            .await
+            .context("qwen fresh fallback spawn_blocking join 失败")?,
+        };
+
+        let fallback_asr_ms = fallback_started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+
+        match validate_fallback_text(text_result, reason, engine) {
+            Ok(text) => {
+                log::info!(
+                    "[local-asr fast] provider=local-qwen3 model={} path=fallback audio_ms={} fallback={} fallback_engine={} fallback_asr_ms={} status=ok",
+                    model_id,
+                    duration_ms,
+                    reason_for_log,
+                    engine_for_log,
+                    fallback_asr_ms
+                );
+                self.buffer.lock().clear();
+                Ok(RawTranscript { text, duration_ms })
+            }
+            Err(error) => {
+                log::error!(
+                    "[local-asr fast] provider=local-qwen3 model={} path=fallback audio_ms={} fallback={} fallback_engine={} fallback_asr_ms={} status=error error={error:#}",
+                    model_id,
+                    duration_ms,
+                    reason_for_log,
+                    engine_for_log,
+                    fallback_asr_ms
+                );
+                Err(error)
+            }
+        }
     }
 
     fn consume_pcm_chunk_live(&self, pcm: &[u8]) {
@@ -270,7 +374,7 @@ impl LocalQwenAsr {
                         LocalQwenRuntimeAction::FeedLive(tx, pcm.to_vec())
                     } else {
                         live.machine
-                            .on_unhealthy(LocalQwenLiveFallbackReason::LiveWorkerFailed);
+                            .on_unhealthy(LocalQwenLiveFallbackReason::WorkerJoinError);
                         LocalQwenRuntimeAction::None
                     }
                 }
@@ -288,7 +392,7 @@ impl LocalQwenAsr {
                     self.mark_live_fallback_needed(LocalQwenLiveFallbackReason::FeederOverflow);
                 }
                 Err(TrySendError::Disconnected(_)) => {
-                    self.mark_live_fallback_needed(LocalQwenLiveFallbackReason::LiveWorkerFailed);
+                    self.mark_live_fallback_needed(LocalQwenLiveFallbackReason::WorkerJoinError);
                 }
             },
             LocalQwenRuntimeAction::None => {}
@@ -351,14 +455,36 @@ impl LocalQwenAsr {
         let worker_engine = Arc::clone(&self.engine);
         let worker_source = Arc::clone(&source);
         let app = self.app.clone();
+        let (worker_result_tx, worker_result_rx) =
+            sync_channel::<std::result::Result<String, LocalQwenLiveWorkerFailure>>(1);
+        let started_at = Instant::now();
+        let last_progress_ms = Arc::new(AtomicU64::new(0));
+        let worker_progress_ms = Arc::clone(&last_progress_ms);
         let worker_handle = match thread::Builder::new()
             .name("openless-qwen-live-worker".into())
             .spawn(move || {
-                worker_engine.transcribe_stream_live_with_handler(&worker_source, move |piece| {
-                    if let Err(e) = app.emit("local-asr-token", piece.to_string()) {
-                        log::warn!("[local-asr] emit live token failed: {e}");
-                    }
-                })
+                let worker_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker_engine.transcribe_stream_live_with_handler(
+                        &worker_source,
+                        move |piece| {
+                            let elapsed_ms =
+                                started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                            worker_progress_ms.store(elapsed_ms, Ordering::Relaxed);
+                            if let Err(e) = app.emit("local-asr-token", piece.to_string()) {
+                                log::warn!("[local-asr] emit live token failed: {e}");
+                            }
+                        },
+                    )
+                }));
+                let message = match worker_result {
+                    Ok(Ok(text)) => Ok(text),
+                    Ok(Err(error)) => Err(LocalQwenLiveWorkerFailure::from_error(error)),
+                    Err(_) => Err(LocalQwenLiveWorkerFailure::new(
+                        LocalQwenLiveFallbackReason::WorkerPanic,
+                        "qwen live worker panicked",
+                    )),
+                };
+                let _ = worker_result_tx.send(message);
             }) {
             Ok(handle) => handle,
             Err(error) => {
@@ -380,6 +506,9 @@ impl LocalQwenAsr {
             feeder_tx: Some(feeder_tx),
             feeder_handle: Some(feeder_handle),
             worker_handle: Some(worker_handle),
+            worker_result_rx,
+            started_at,
+            last_progress_ms,
         });
         live.machine.on_live_worker_started();
     }
@@ -424,14 +553,14 @@ impl LocalQwenLiveController {
         self.runtime.take()
     }
 
-    fn cancel_runtime(&mut self) {
-        if let Some(runtime) = self.runtime.take() {
-            runtime.cancel_detached();
-        }
+    fn take_runtime_for_cancel(&mut self) -> Option<LocalQwenLiveRuntime> {
+        self.runtime.take()
     }
 
     fn cancel(&mut self) {
-        self.cancel_runtime();
+        if let Some(runtime) = self.runtime.take() {
+            runtime.cancel_detached();
+        }
         self.machine.cancel();
     }
 }
@@ -441,7 +570,10 @@ struct LocalQwenLiveRuntime {
     source: Arc<QwenLiveAudioSource>,
     feeder_tx: Option<SyncSender<Vec<u8>>>,
     feeder_handle: Option<JoinHandle<Result<()>>>,
-    worker_handle: Option<JoinHandle<Result<String>>>,
+    worker_handle: Option<JoinHandle<()>>,
+    worker_result_rx: Receiver<std::result::Result<String, LocalQwenLiveWorkerFailure>>,
+    started_at: Instant,
+    last_progress_ms: Arc<AtomicU64>,
 }
 
 #[cfg(target_os = "macos")]
@@ -455,25 +587,214 @@ impl LocalQwenLiveRuntime {
 }
 
 #[cfg(target_os = "macos")]
-fn finalize_live_runtime(mut runtime: LocalQwenLiveRuntime) -> Result<String> {
+fn finalize_live_runtime(
+    mut runtime: LocalQwenLiveRuntime,
+    audio_secs: f64,
+) -> LocalQwenLiveFinishOutcome {
     runtime.feeder_tx.take();
     if let Some(handle) = runtime.feeder_handle.take() {
-        handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("qwen live feeder panicked"))?
-            .context("qwen live feeder failed")?;
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return fallback_after_live_cancel_with_detail(
+                    runtime,
+                    LocalQwenLiveFallbackReason::FeederAppendFailed,
+                    format!("qwen live feeder failed: {error:#}"),
+                );
+            }
+            Err(_) => {
+                return fallback_after_live_cancel_with_detail(
+                    runtime,
+                    LocalQwenLiveFallbackReason::FeederAppendFailed,
+                    "qwen live feeder panicked",
+                );
+            }
+        }
     }
 
     runtime.source.finish();
+    let finalize_timeout = live_finalize_timeout(audio_secs);
+    let progress_stall_timeout = live_progress_stall_timeout(finalize_timeout);
+    let finalize_started_ms = runtime
+        .started_at
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let deadline = Instant::now() + finalize_timeout;
 
-    let worker = runtime
-        .worker_handle
-        .take()
-        .context("qwen live worker handle missing")?;
-    worker
-        .join()
-        .map_err(|_| anyhow::anyhow!("qwen live worker panicked"))?
-        .context("qwen live worker failed")
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return fallback_after_live_cancel(
+                runtime,
+                LocalQwenLiveFallbackReason::FinalizeTimeout,
+            );
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let wait_for = remaining.min(Duration::from_millis(100));
+        match runtime.worker_result_rx.recv_timeout(wait_for) {
+            Ok(Ok(text)) => {
+                join_finished_worker(&mut runtime);
+                return live_text_finish_outcome(text);
+            }
+            Ok(Err(failure)) => {
+                join_finished_worker(&mut runtime);
+                return LocalQwenLiveFinishOutcome::fallback(
+                    failure.reason,
+                    failure.detail,
+                    LocalQwenFallbackEngine::Cached,
+                );
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                join_finished_worker(&mut runtime);
+                return LocalQwenLiveFinishOutcome::fallback(
+                    LocalQwenLiveFallbackReason::WorkerJoinError,
+                    "qwen live worker result channel disconnected",
+                    LocalQwenFallbackEngine::Cached,
+                );
+            }
+        }
+        if live_progress_idle_duration(&runtime, finalize_started_ms) >= progress_stall_timeout {
+            return fallback_after_live_cancel(runtime, LocalQwenLiveFallbackReason::ProgressStall);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cancel_live_runtime_for_fallback(
+    runtime: LocalQwenLiveRuntime,
+    reason: LocalQwenLiveFallbackReason,
+) -> (LocalQwenLiveFallbackReason, LocalQwenFallbackEngine) {
+    match fallback_after_live_cancel(runtime, reason) {
+        LocalQwenLiveFinishOutcome::Final(_) => (reason, LocalQwenFallbackEngine::Cached),
+        LocalQwenLiveFinishOutcome::Fallback { reason, engine, .. } => (reason, engine),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn fallback_after_live_cancel(
+    runtime: LocalQwenLiveRuntime,
+    reason: LocalQwenLiveFallbackReason,
+) -> LocalQwenLiveFinishOutcome {
+    fallback_after_live_cancel_with_detail(runtime, reason, reason.as_str())
+}
+
+#[cfg(target_os = "macos")]
+fn fallback_after_live_cancel_with_detail(
+    mut runtime: LocalQwenLiveRuntime,
+    reason: LocalQwenLiveFallbackReason,
+    detail: impl Into<String>,
+) -> LocalQwenLiveFinishOutcome {
+    let detail = detail.into();
+    runtime.feeder_tx.take();
+    runtime.source.cancel();
+    if let Some(handle) = runtime.feeder_handle.take() {
+        let _ = handle.join();
+    }
+
+    match runtime
+        .worker_result_rx
+        .recv_timeout(Duration::from_millis(LIVE_CANCEL_JOIN_GRACE_MS))
+    {
+        Ok(_) | Err(RecvTimeoutError::Disconnected) => {
+            join_finished_worker(&mut runtime);
+            LocalQwenLiveFinishOutcome::fallback(
+                reason,
+                format!("{detail}; live worker exited within cancel grace"),
+                LocalQwenFallbackEngine::Cached,
+            )
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            runtime.worker_handle.take();
+            LocalQwenLiveFinishOutcome::fallback(
+                LocalQwenLiveFallbackReason::LiveCancelGraceExceeded,
+                format!(
+                    "{detail}; {}; live worker still busy after {}ms",
+                    reason.as_str(),
+                    LIVE_CANCEL_JOIN_GRACE_MS
+                ),
+                LocalQwenFallbackEngine::Fresh,
+            )
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn join_finished_worker(runtime: &mut LocalQwenLiveRuntime) {
+    if let Some(handle) = runtime.worker_handle.take() {
+        let _ = handle.join();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn live_progress_idle_duration(
+    runtime: &LocalQwenLiveRuntime,
+    baseline_elapsed_ms: u64,
+) -> Duration {
+    let last_progress_ms = runtime.last_progress_ms.load(Ordering::Relaxed);
+    let elapsed_ms = runtime
+        .started_at
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    Duration::from_millis(elapsed_ms.saturating_sub(last_progress_ms.max(baseline_elapsed_ms)))
+}
+
+#[cfg(target_os = "macos")]
+fn live_finalize_timeout(audio_secs: f64) -> Duration {
+    if audio_secs <= 15.0 {
+        Duration::from_secs(3)
+    } else if audio_secs <= 60.0 {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_secs((audio_secs * 0.2).ceil() as u64 + 5)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn live_progress_stall_timeout(finalize_timeout: Duration) -> Duration {
+    Duration::from_millis(LIVE_PROGRESS_STALL_MS).min(finalize_timeout)
+}
+
+#[cfg(target_os = "macos")]
+fn live_text_finish_outcome(text: String) -> LocalQwenLiveFinishOutcome {
+    if text.is_empty() {
+        return LocalQwenLiveFinishOutcome::fallback(
+            LocalQwenLiveFallbackReason::EmptyLiveResult,
+            "qwen live returned empty text",
+            LocalQwenFallbackEngine::Cached,
+        );
+    }
+    if text.trim().is_empty() {
+        return LocalQwenLiveFinishOutcome::fallback(
+            LocalQwenLiveFallbackReason::InvalidLiveResult,
+            "qwen live returned whitespace-only text",
+            LocalQwenFallbackEngine::Cached,
+        );
+    }
+    LocalQwenLiveFinishOutcome::Final(text)
+}
+
+#[cfg(target_os = "macos")]
+fn validate_fallback_text(
+    result: Result<String>,
+    live_reason: LocalQwenLiveFallbackReason,
+    engine: LocalQwenFallbackEngine,
+) -> Result<String> {
+    match result {
+        Ok(text) if !text.trim().is_empty() => Ok(text),
+        Ok(_) => anyhow::bail!(
+            "local Qwen fallback returned empty transcript after live_reason={} fallback_engine={}",
+            live_reason.as_str(),
+            engine.as_str()
+        ),
+        Err(error) => anyhow::bail!(
+            "local Qwen fallback failed after live_reason={} fallback_engine={}: {error:#}",
+            live_reason.as_str(),
+            engine.as_str()
+        ),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -494,8 +815,15 @@ enum LocalQwenLivePhase {
 enum LocalQwenLiveFallbackReason {
     LiveStartFailed,
     FeederOverflow,
-    LiveWorkerFailed,
+    FeederAppendFailed,
+    WorkerPanic,
+    WorkerJoinError,
+    CNull,
     EmptyLiveResult,
+    InvalidLiveResult,
+    FinalizeTimeout,
+    ProgressStall,
+    LiveCancelGraceExceeded,
 }
 
 #[cfg(target_os = "macos")]
@@ -504,8 +832,85 @@ impl LocalQwenLiveFallbackReason {
         match self {
             Self::LiveStartFailed => "live_start_failed",
             Self::FeederOverflow => "feeder_overflow",
-            Self::LiveWorkerFailed => "live_worker_failed",
+            Self::FeederAppendFailed => "feeder_append_failed",
+            Self::WorkerPanic => "worker_panic",
+            Self::WorkerJoinError => "worker_join_error",
+            Self::CNull => "c_null",
             Self::EmptyLiveResult => "empty_live_result",
+            Self::InvalidLiveResult => "invalid_live_result",
+            Self::FinalizeTimeout => "finalize_timeout",
+            Self::ProgressStall => "progress_stall",
+            Self::LiveCancelGraceExceeded => "live_cancel_grace_exceeded",
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct LocalQwenLiveWorkerFailure {
+    reason: LocalQwenLiveFallbackReason,
+    detail: String,
+}
+
+#[cfg(target_os = "macos")]
+impl LocalQwenLiveWorkerFailure {
+    fn new(reason: LocalQwenLiveFallbackReason, detail: impl Into<String>) -> Self {
+        Self {
+            reason,
+            detail: detail.into(),
+        }
+    }
+
+    fn from_error(error: anyhow::Error) -> Self {
+        let detail = format!("{error:#}");
+        let reason = if detail.contains("NULL") || detail.contains("返回 NULL") {
+            LocalQwenLiveFallbackReason::CNull
+        } else {
+            LocalQwenLiveFallbackReason::WorkerJoinError
+        };
+        Self { reason, detail }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalQwenFallbackEngine {
+    Cached,
+    Fresh,
+}
+
+#[cfg(target_os = "macos")]
+impl LocalQwenFallbackEngine {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cached => "cached",
+            Self::Fresh => "fresh",
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+enum LocalQwenLiveFinishOutcome {
+    Final(String),
+    Fallback {
+        reason: LocalQwenLiveFallbackReason,
+        detail: String,
+        engine: LocalQwenFallbackEngine,
+    },
+}
+
+#[cfg(target_os = "macos")]
+impl LocalQwenLiveFinishOutcome {
+    fn fallback(
+        reason: LocalQwenLiveFallbackReason,
+        detail: impl Into<String>,
+        engine: LocalQwenFallbackEngine,
+    ) -> Self {
+        Self::Fallback {
+            reason,
+            detail: detail.into(),
+            engine,
         }
     }
 }
@@ -629,10 +1034,10 @@ impl LocalQwenLiveStateMachine {
             }
             LocalQwenLivePhase::FallbackNeeded => LocalQwenStopAction::FallbackNeeded(
                 self.fallback_reason
-                    .unwrap_or(LocalQwenLiveFallbackReason::LiveWorkerFailed),
+                    .unwrap_or(LocalQwenLiveFallbackReason::WorkerJoinError),
             ),
             LocalQwenLivePhase::Finalizing => {
-                LocalQwenStopAction::FallbackNeeded(LocalQwenLiveFallbackReason::LiveWorkerFailed)
+                LocalQwenStopAction::FallbackNeeded(LocalQwenLiveFallbackReason::WorkerJoinError)
             }
             LocalQwenLivePhase::LiveFinal => LocalQwenStopAction::DirectFinal,
             LocalQwenLivePhase::Cancelled => LocalQwenStopAction::Cancelled,
@@ -748,6 +1153,57 @@ mod tests {
             machine.on_stop(),
             LocalQwenStopAction::FallbackNeeded(LocalQwenLiveFallbackReason::LiveStartFailed)
         );
+    }
+
+    #[test]
+    fn local_qwen_live_timeout_policy_scales_by_audio_duration() {
+        assert_eq!(live_finalize_timeout(2.1), Duration::from_secs(3));
+        assert_eq!(live_finalize_timeout(15.0), Duration::from_secs(3));
+        assert_eq!(live_finalize_timeout(30.0), Duration::from_secs(5));
+        assert_eq!(live_finalize_timeout(75.0), Duration::from_secs(20));
+    }
+
+    #[test]
+    fn local_qwen_live_invalid_result_needs_cached_fallback() {
+        match live_text_finish_outcome("   ".to_string()) {
+            LocalQwenLiveFinishOutcome::Fallback { reason, engine, .. } => {
+                assert_eq!(reason, LocalQwenLiveFallbackReason::InvalidLiveResult);
+                assert_eq!(engine, LocalQwenFallbackEngine::Cached);
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_qwen_live_hard_stall_uses_fresh_fallback_engine() {
+        let outcome = LocalQwenLiveFinishOutcome::fallback(
+            LocalQwenLiveFallbackReason::LiveCancelGraceExceeded,
+            "live worker still busy",
+            LocalQwenFallbackEngine::Fresh,
+        );
+
+        match outcome {
+            LocalQwenLiveFinishOutcome::Fallback { reason, engine, .. } => {
+                assert_eq!(reason, LocalQwenLiveFallbackReason::LiveCancelGraceExceeded);
+                assert_eq!(engine, LocalQwenFallbackEngine::Fresh);
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_qwen_fallback_both_path_failure_is_clear() {
+        let err = validate_fallback_text(
+            Err(anyhow::anyhow!("fallback engine failed")),
+            LocalQwenLiveFallbackReason::FinalizeTimeout,
+            LocalQwenFallbackEngine::Fresh,
+        )
+        .expect_err("both-path failure should be an error");
+        let msg = format!("{err:#}");
+
+        assert!(msg.contains("live_reason=finalize_timeout"));
+        assert!(msg.contains("fallback_engine=fresh"));
+        assert!(msg.contains("fallback engine failed"));
     }
 
     #[test]

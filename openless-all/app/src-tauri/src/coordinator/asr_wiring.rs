@@ -223,7 +223,10 @@ pub(super) enum AsrReleaseSession {
 }
 
 #[cfg(target_os = "windows")]
-pub(super) fn asr_release_session_is_current(inner: &Arc<Inner>, session: AsrReleaseSession) -> bool {
+pub(super) fn asr_release_session_is_current(
+    inner: &Arc<Inner>,
+    session: AsrReleaseSession,
+) -> bool {
     match session {
         AsrReleaseSession::Dictation(session_id) => inner.state.lock().session_id == session_id,
         AsrReleaseSession::Qa(session_id) => inner.qa_state.lock().session_id == session_id,
@@ -290,6 +293,7 @@ pub(super) async fn build_local_qwen3(
     // 1.2GB+ 模型。第一次加载阻塞数秒，spawn_blocking 不卡 tokio runtime。
     let cache = Arc::clone(&inner.local_asr_cache);
     let mid = model_id.as_str().to_string();
+    let model_dir = dir.clone();
     let load_started = std::time::Instant::now();
     let loaded =
         tauri::async_runtime::spawn_blocking(move || cache.get_or_load_with_status(&mid, &dir))
@@ -308,6 +312,7 @@ pub(super) async fn build_local_qwen3(
         app,
         loaded.engine,
         model_id.as_str().to_string(),
+        model_dir,
         loaded.outcome,
     )))
 }
@@ -445,7 +450,10 @@ impl QaAsrStart {
     }
 }
 
-pub(super) async fn build_qa_asr_start(inner: &Arc<Inner>, active_asr: &str) -> Result<QaAsrStart, String> {
+pub(super) async fn build_qa_asr_start(
+    inner: &Arc<Inner>,
+    active_asr: &str,
+) -> Result<QaAsrStart, String> {
     #[cfg(target_os = "windows")]
     if foundry::is_foundry_local_whisper(active_asr) {
         let prefs = inner.prefs.get();

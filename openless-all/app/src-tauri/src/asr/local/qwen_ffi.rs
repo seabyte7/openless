@@ -11,6 +11,13 @@ pub struct QwenCtx {
     _opaque: [u8; 0],
 }
 
+/// 不透明的 qwen_live_audio_t；只通过 C API 创建、追加、结束、取消和释放。
+#[allow(dead_code)]
+#[repr(C)]
+pub struct QwenLiveAudio {
+    _opaque: [u8; 0],
+}
+
 /// `typedef void (*qwen_token_cb)(const char *piece, void *userdata);`
 pub type QwenTokenCb = unsafe extern "C" fn(piece: *const c_char, userdata: *mut c_void);
 
@@ -39,4 +46,20 @@ extern "C" {
         samples: *const f32,
         n_samples: c_int,
     ) -> *mut c_char;
+
+    pub fn qwen_live_audio_create() -> *mut QwenLiveAudio;
+    pub fn qwen_live_audio_append_s16le(
+        live: *mut QwenLiveAudio,
+        buf: *const u8,
+        n_bytes: usize,
+    ) -> c_int;
+    pub fn qwen_live_audio_append_f32(
+        live: *mut QwenLiveAudio,
+        samples: *const f32,
+        n_samples: c_int,
+    ) -> c_int;
+    pub fn qwen_live_audio_finish(live: *mut QwenLiveAudio);
+    pub fn qwen_live_audio_cancel(live: *mut QwenLiveAudio);
+    pub fn qwen_live_audio_free(live: *mut QwenLiveAudio);
+    pub fn qwen_transcribe_stream_live(ctx: *mut QwenCtx, live: *mut QwenLiveAudio) -> *mut c_char;
 }

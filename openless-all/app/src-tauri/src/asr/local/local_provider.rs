@@ -8,6 +8,8 @@
 //! 取已缓存的引擎再传进来，避免每次会话都重加载 1.2GB+ 模型。
 
 #[cfg(target_os = "macos")]
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
@@ -26,6 +28,8 @@ use crate::asr::RawTranscript;
 pub struct LocalQwenAsr {
     engine: Arc<QwenAsrEngine>,
     model_id: String,
+    #[allow(dead_code)]
+    model_dir: PathBuf,
     engine_cache: LocalAsrCacheOutcome,
     /// 16-bit LE PCM 字节缓冲（recorder 推什么我们存什么），在 transcribe 时再
     /// 转 f32 喂给 C 端。一次会话最多几 MB，clone 一次成本可接受。
@@ -39,11 +43,13 @@ impl LocalQwenAsr {
         app: AppHandle,
         engine: Arc<QwenAsrEngine>,
         model_id: String,
+        model_dir: PathBuf,
         engine_cache: LocalAsrCacheOutcome,
     ) -> Self {
         Self {
             engine,
             model_id,
+            model_dir,
             engine_cache,
             buffer: Mutex::new(Vec::new()),
             app,
@@ -52,6 +58,11 @@ impl LocalQwenAsr {
 
     pub fn model_id(&self) -> &str {
         &self.model_id
+    }
+
+    #[allow(dead_code)]
+    pub fn model_dir(&self) -> &Path {
+        &self.model_dir
     }
 
     pub fn engine_cache(&self) -> LocalAsrCacheOutcome {
@@ -87,25 +98,21 @@ impl LocalQwenAsr {
         // 注册 token 回调：每个稳定 token 抛 `local-asr-token` 事件。
         // capsule 前端按 sessionId 累积显示。
         let app = self.app.clone();
-        self.engine.set_token_handler(Some(move |piece: &str| {
-            if let Err(e) = app.emit("local-asr-token", piece.to_string()) {
-                log::warn!("[local-asr] emit token failed: {e}");
-            }
-        }));
-        let _token_handler_guard = TokenHandlerGuard {
-            engine: Arc::clone(&self.engine),
-        };
-
         // qwen_transcribe_stream 是阻塞调用；用 spawn_blocking 防止占住 tokio runtime。
         // 用 tauri::async_runtime::spawn_blocking 而非 tokio 的 —— 同 download.rs 注释，
         // 走 Tauri 持有的 runtime handle，不依赖调用方上下文（虽然这里目前都在 async 路径上调，
         // 但保持一致更稳）。
         let engine = Arc::clone(&self.engine);
-        let text =
-            tauri::async_runtime::spawn_blocking(move || engine.transcribe_stream(&samples_f32))
-                .await
-                .context("transcribe spawn_blocking join 失败")?
-                .context("qwen_transcribe_stream 失败")?;
+        let text = tauri::async_runtime::spawn_blocking(move || {
+            engine.transcribe_stream_with_handler(&samples_f32, move |piece: &str| {
+                if let Err(e) = app.emit("local-asr-token", piece.to_string()) {
+                    log::warn!("[local-asr] emit token failed: {e}");
+                }
+            })
+        })
+        .await
+        .context("transcribe spawn_blocking join 失败")?
+        .context("qwen_transcribe_stream 失败")?;
 
         self.buffer.lock().clear();
 
@@ -133,16 +140,4 @@ fn i16_le_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
             v as f32 / 32768.0
         })
         .collect()
-}
-
-#[cfg(target_os = "macos")]
-struct TokenHandlerGuard {
-    engine: Arc<QwenAsrEngine>,
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for TokenHandlerGuard {
-    fn drop(&mut self) {
-        self.engine.set_token_handler::<fn(&str)>(None);
-    }
 }

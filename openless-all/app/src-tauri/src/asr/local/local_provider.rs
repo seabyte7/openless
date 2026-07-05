@@ -1,16 +1,20 @@
 //! 本地 Qwen3-ASR 在 dictation 路径上的适配器。
 //!
 //! 与 `WhisperBatchASR` 形状对齐：实现 `AudioConsumer` 缓冲 PCM，stop 时
-//! 调 `transcribe_stream`，期间每个稳定 token 通过 Tauri 事件
-//! `local-asr-token` 推到前端胶囊做实时显示。
+//! 产出 `RawTranscript`。`BatchOnly` 保持现有整段伪流式路径；`DictationLive`
+//! 是后续普通听写 live-first 接入用的可测试状态机，本 issue 先不在生产路径启用。
 //!
-//! engine 现在由 `LocalAsrCache` 提供——Coordinator 在 build_local_qwen3 里
+//! engine 由 `LocalAsrCache` 提供——Coordinator 在 build_local_qwen3 里
 //! 取已缓存的引擎再传进来，避免每次会话都重加载 1.2GB+ 模型。
 
 #[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+#[cfg(target_os = "macos")]
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::thread::{self, JoinHandle};
 
 #[cfg(target_os = "macos")]
 use anyhow::{Context, Result};
@@ -18,11 +22,54 @@ use anyhow::{Context, Result};
 use parking_lot::Mutex;
 #[cfg(target_os = "macos")]
 use tauri::{AppHandle, Emitter};
+#[cfg(target_os = "macos")]
+use uuid::Uuid;
 
 #[cfg(target_os = "macos")]
 use super::{LocalAsrCacheOutcome, QwenAsrEngine};
 #[cfg(target_os = "macos")]
 use crate::asr::RawTranscript;
+
+#[cfg(target_os = "macos")]
+use super::qwen_engine::QwenLiveAudioSource;
+
+#[cfg(target_os = "macos")]
+const SAMPLE_RATE_HZ: u64 = 16_000;
+#[cfg(target_os = "macos")]
+const BYTES_PER_SAMPLE: u64 = 2;
+#[cfg(target_os = "macos")]
+const BATCH_STREAM_TAIL_SILENCE_SAMPLES: usize = 8_000;
+#[cfg(target_os = "macos")]
+const LIVE_START_THRESHOLD_MS: u64 = 2_000;
+#[cfg(target_os = "macos")]
+const LIVE_FEEDER_CHANNEL_CAPACITY: usize = 64;
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalQwenSessionMode {
+    #[allow(dead_code)]
+    DictationLive {
+        session_id: Uuid,
+    },
+    BatchOnly,
+}
+
+#[cfg(target_os = "macos")]
+impl Default for LocalQwenSessionMode {
+    fn default() -> Self {
+        Self::BatchOnly
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl LocalQwenSessionMode {
+    fn live_session_id(self) -> Option<Uuid> {
+        match self {
+            Self::DictationLive { session_id } => Some(session_id),
+            Self::BatchOnly => None,
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 pub struct LocalQwenAsr {
@@ -31,14 +78,17 @@ pub struct LocalQwenAsr {
     #[allow(dead_code)]
     model_dir: PathBuf,
     engine_cache: LocalAsrCacheOutcome,
-    /// 16-bit LE PCM 字节缓冲（recorder 推什么我们存什么），在 transcribe 时再
-    /// 转 f32 喂给 C 端。一次会话最多几 MB，clone 一次成本可接受。
+    mode: LocalQwenSessionMode,
+    /// 16-bit LE PCM 字节缓冲（recorder 推什么我们存什么），live 和 fallback
+    /// 都必须以它为可靠来源。一次会话最多几 MB，stop 时 clone 一次可接受。
     buffer: Mutex<Vec<u8>>,
+    live: Mutex<LocalQwenLiveController>,
     app: AppHandle,
 }
 
 #[cfg(target_os = "macos")]
 impl LocalQwenAsr {
+    #[allow(dead_code)]
     pub fn new(
         app: AppHandle,
         engine: Arc<QwenAsrEngine>,
@@ -46,12 +96,32 @@ impl LocalQwenAsr {
         model_dir: PathBuf,
         engine_cache: LocalAsrCacheOutcome,
     ) -> Self {
+        Self::new_with_mode(
+            app,
+            engine,
+            model_id,
+            model_dir,
+            engine_cache,
+            LocalQwenSessionMode::BatchOnly,
+        )
+    }
+
+    pub fn new_with_mode(
+        app: AppHandle,
+        engine: Arc<QwenAsrEngine>,
+        model_id: String,
+        model_dir: PathBuf,
+        engine_cache: LocalAsrCacheOutcome,
+        mode: LocalQwenSessionMode,
+    ) -> Self {
         Self {
             engine,
             model_id,
             model_dir,
             engine_cache,
+            mode,
             buffer: Mutex::new(Vec::new()),
+            live: Mutex::new(LocalQwenLiveController::default()),
             app,
         }
     }
@@ -70,14 +140,13 @@ impl LocalQwenAsr {
     }
 
     /// 当前缓冲音频时长（毫秒）。Coordinator 在 transcribe() 调用前读取，
-    /// 用来给本地 Qwen ASR 计算动态超时（max(15, ceil(audio_s × 0.6) + 10)）。
-    /// 不消费缓冲。
+    /// 用来给本地 Qwen ASR 计算动态超时。不消费缓冲。
     pub fn buffer_duration_ms(&self) -> u64 {
-        (self.buffer.lock().len() as u64 / 2) * 1000 / 16_000
+        duration_ms_from_pcm_bytes(self.buffer.lock().len())
     }
 
-    /// stop 时调用：把 buffer 的 i16 PCM 转 f32，跑流式转写，token 实时
-    /// 通过事件吐到前端胶囊；最终文本一起返回供 polish/insert。
+    /// stop 时调用：`BatchOnly` 保持当前整段伪流式行为；`DictationLive`
+    /// 在录音期间已启动 live worker 时只负责 finish + join。
     pub async fn transcribe(self: Arc<Self>) -> Result<RawTranscript> {
         let pcm_bytes = self.buffer.lock().clone();
         if pcm_bytes.is_empty() {
@@ -86,22 +155,35 @@ impl LocalQwenAsr {
                 duration_ms: 0,
             });
         }
-        let duration_ms = (pcm_bytes.len() as u64 / 2) * 1000 / 16_000;
+        let duration_ms = duration_ms_from_pcm_bytes(pcm_bytes.len());
+
+        if self.mode.live_session_id().is_none() {
+            return self.transcribe_batch_stream(pcm_bytes, duration_ms).await;
+        }
+
+        self.transcribe_live_mode(pcm_bytes, duration_ms).await
+    }
+
+    pub fn cancel(&self) {
+        self.buffer.lock().clear();
+        self.live.lock().cancel();
+    }
+
+    async fn transcribe_batch_stream(
+        &self,
+        pcm_bytes: Vec<u8>,
+        duration_ms: u64,
+    ) -> Result<RawTranscript> {
         let mut samples_f32 = i16_le_bytes_to_f32(&pcm_bytes);
         // `transcribe_stream` 内部按 2s chunk 切片；末 chunk < 2s 且缓冲没有
         // 静默尾巴时，C 引擎不会把它当作"语音已结束"，该 chunk 的转写结果
         // 会被丢弃，导致末段内容消失。这里追加 0.5s 静默（@16kHz = 8000 个
-        // f32 零值）作为收尾信号。`duration_ms` 仍按原始缓冲长度计算（上面
-        // 一行），padding 不计入。
-        samples_f32.extend(std::iter::repeat(0.0f32).take(8_000));
+        // f32 零值）作为收尾信号。`duration_ms` 仍按原始缓冲长度计算。
+        samples_f32.extend(std::iter::repeat(0.0f32).take(BATCH_STREAM_TAIL_SILENCE_SAMPLES));
 
         // 注册 token 回调：每个稳定 token 抛 `local-asr-token` 事件。
         // capsule 前端按 sessionId 累积显示。
         let app = self.app.clone();
-        // qwen_transcribe_stream 是阻塞调用；用 spawn_blocking 防止占住 tokio runtime。
-        // 用 tauri::async_runtime::spawn_blocking 而非 tokio 的 —— 同 download.rs 注释，
-        // 走 Tauri 持有的 runtime handle，不依赖调用方上下文（虽然这里目前都在 async 路径上调，
-        // 但保持一致更稳）。
         let engine = Arc::clone(&self.engine);
         let text = tauri::async_runtime::spawn_blocking(move || {
             engine.transcribe_stream_with_handler(&samples_f32, move |piece: &str| {
@@ -115,20 +197,466 @@ impl LocalQwenAsr {
         .context("qwen_transcribe_stream 失败")?;
 
         self.buffer.lock().clear();
-
         Ok(RawTranscript { text, duration_ms })
     }
 
-    pub fn cancel(&self) {
-        self.buffer.lock().clear();
+    async fn transcribe_live_mode(
+        &self,
+        pcm_bytes: Vec<u8>,
+        duration_ms: u64,
+    ) -> Result<RawTranscript> {
+        let stop_action = {
+            let mut live = self.live.lock();
+            live.machine.on_stop()
+        };
+        match stop_action {
+            LocalQwenStopAction::DirectFinal => {
+                let text = self.transcribe_direct_final(pcm_bytes).await?;
+                self.buffer.lock().clear();
+                Ok(RawTranscript { text, duration_ms })
+            }
+            LocalQwenStopAction::FinishLive => {
+                let runtime = self.live.lock().take_runtime_for_finalize();
+                let Some(runtime) = runtime else {
+                    self.mark_live_fallback_needed(LocalQwenLiveFallbackReason::LiveWorkerFailed);
+                    anyhow::bail!("local Qwen live path missing runtime; fallback needed");
+                };
+                let text =
+                    tauri::async_runtime::spawn_blocking(move || finalize_live_runtime(runtime))
+                        .await
+                        .context("qwen live finalize spawn_blocking join 失败")?
+                        .context("qwen live finalize failed")?;
+
+                if text.trim().is_empty() {
+                    self.mark_live_fallback_needed(LocalQwenLiveFallbackReason::EmptyLiveResult);
+                    anyhow::bail!("local Qwen live result empty; fallback needed");
+                }
+
+                self.live.lock().machine.on_live_final();
+                self.buffer.lock().clear();
+                Ok(RawTranscript { text, duration_ms })
+            }
+            LocalQwenStopAction::FallbackNeeded(reason) => {
+                self.live.lock().cancel_runtime();
+                anyhow::bail!("local Qwen live fallback needed: {}", reason.as_str());
+            }
+            LocalQwenStopAction::Cancelled => {
+                anyhow::bail!("local Qwen live session cancelled");
+            }
+        }
+    }
+
+    async fn transcribe_direct_final(&self, pcm_bytes: Vec<u8>) -> Result<String> {
+        let samples_f32 = i16_le_bytes_to_f32(&pcm_bytes);
+        let engine = Arc::clone(&self.engine);
+        tauri::async_runtime::spawn_blocking(move || engine.transcribe_stream_final(&samples_f32))
+            .await
+            .context("qwen direct final spawn_blocking join 失败")?
+            .context("qwen direct final failed")
+    }
+
+    fn consume_pcm_chunk_live(&self, pcm: &[u8]) {
+        let live_action = {
+            let mut buffer = self.buffer.lock();
+            buffer.extend_from_slice(pcm);
+
+            let mut live = self.live.lock();
+            match live.machine.on_pcm_chunk(pcm.len()) {
+                LocalQwenConsumeAction::StartLive => {
+                    LocalQwenRuntimeAction::StartLive(buffer.clone())
+                }
+                LocalQwenConsumeAction::FeedLive => {
+                    if let Some(tx) = live.feeder_tx() {
+                        LocalQwenRuntimeAction::FeedLive(tx, pcm.to_vec())
+                    } else {
+                        live.machine
+                            .on_unhealthy(LocalQwenLiveFallbackReason::LiveWorkerFailed);
+                        LocalQwenRuntimeAction::None
+                    }
+                }
+                LocalQwenConsumeAction::None => LocalQwenRuntimeAction::None,
+            }
+        };
+
+        match live_action {
+            LocalQwenRuntimeAction::StartLive(initial_pcm) => {
+                self.start_live_from_pcm(initial_pcm);
+            }
+            LocalQwenRuntimeAction::FeedLive(tx, chunk) => match tx.try_send(chunk) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    self.mark_live_fallback_needed(LocalQwenLiveFallbackReason::FeederOverflow);
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    self.mark_live_fallback_needed(LocalQwenLiveFallbackReason::LiveWorkerFailed);
+                }
+            },
+            LocalQwenRuntimeAction::None => {}
+        }
+    }
+
+    fn start_live_from_pcm(&self, initial_pcm: Vec<u8>) {
+        let Some(session_id) = self.mode.live_session_id() else {
+            return;
+        };
+
+        let source = match QwenLiveAudioSource::create() {
+            Ok(source) => Arc::new(source),
+            Err(error) => {
+                log::warn!(
+                    "[local-asr fast] session={} path=live event=start_failed reason=create_source error={error:#}",
+                    session_id
+                );
+                self.mark_live_start_failed();
+                return;
+            }
+        };
+
+        let (feeder_tx, feeder_rx) = sync_channel::<Vec<u8>>(LIVE_FEEDER_CHANNEL_CAPACITY);
+        let feeder_source = Arc::clone(&source);
+        let feeder_handle = match thread::Builder::new()
+            .name("openless-qwen-live-feeder".into())
+            .spawn(move || -> Result<()> {
+                while let Ok(chunk) = feeder_rx.recv() {
+                    feeder_source
+                        .append_s16le(&chunk)
+                        .context("qwen live feeder append_s16le failed")?;
+                }
+                Ok(())
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                log::warn!(
+                    "[local-asr fast] session={} path=live event=start_failed reason=spawn_feeder error={error}",
+                    session_id
+                );
+                source.cancel();
+                self.mark_live_start_failed();
+                return;
+            }
+        };
+
+        if let Err(error) = feeder_tx.try_send(initial_pcm) {
+            log::warn!(
+                "[local-asr fast] session={} path=live event=start_failed reason=initial_feed error={error}",
+                session_id
+            );
+            source.cancel();
+            drop(feeder_tx);
+            let _ = feeder_handle.join();
+            self.mark_live_fallback_needed(LocalQwenLiveFallbackReason::FeederOverflow);
+            return;
+        }
+
+        let worker_engine = Arc::clone(&self.engine);
+        let worker_source = Arc::clone(&source);
+        let app = self.app.clone();
+        let worker_handle = match thread::Builder::new()
+            .name("openless-qwen-live-worker".into())
+            .spawn(move || {
+                worker_engine.transcribe_stream_live_with_handler(&worker_source, move |piece| {
+                    if let Err(e) = app.emit("local-asr-token", piece.to_string()) {
+                        log::warn!("[local-asr] emit live token failed: {e}");
+                    }
+                })
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                log::warn!(
+                    "[local-asr fast] session={} path=live event=start_failed reason=spawn_worker error={error}",
+                    session_id
+                );
+                source.cancel();
+                drop(feeder_tx);
+                let _ = feeder_handle.join();
+                self.mark_live_start_failed();
+                return;
+            }
+        };
+
+        let mut live = self.live.lock();
+        live.runtime = Some(LocalQwenLiveRuntime {
+            source,
+            feeder_tx: Some(feeder_tx),
+            feeder_handle: Some(feeder_handle),
+            worker_handle: Some(worker_handle),
+        });
+        live.machine.on_live_worker_started();
+    }
+
+    fn mark_live_fallback_needed(&self, reason: LocalQwenLiveFallbackReason) {
+        self.live.lock().machine.on_unhealthy(reason);
+    }
+
+    fn mark_live_start_failed(&self) {
+        self.live.lock().machine.on_live_start_failed();
     }
 }
 
 #[cfg(target_os = "macos")]
 impl crate::recorder::AudioConsumer for LocalQwenAsr {
     fn consume_pcm_chunk(&self, pcm: &[u8]) {
+        if self.mode.live_session_id().is_some() {
+            self.consume_pcm_chunk_live(pcm);
+            return;
+        }
         self.buffer.lock().extend_from_slice(pcm);
     }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct LocalQwenLiveController {
+    machine: LocalQwenLiveStateMachine,
+    runtime: Option<LocalQwenLiveRuntime>,
+}
+
+#[cfg(target_os = "macos")]
+impl LocalQwenLiveController {
+    fn feeder_tx(&self) -> Option<SyncSender<Vec<u8>>> {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.feeder_tx.as_ref())
+            .cloned()
+    }
+
+    fn take_runtime_for_finalize(&mut self) -> Option<LocalQwenLiveRuntime> {
+        self.runtime.take()
+    }
+
+    fn cancel_runtime(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.cancel_detached();
+        }
+    }
+
+    fn cancel(&mut self) {
+        self.cancel_runtime();
+        self.machine.cancel();
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct LocalQwenLiveRuntime {
+    source: Arc<QwenLiveAudioSource>,
+    feeder_tx: Option<SyncSender<Vec<u8>>>,
+    feeder_handle: Option<JoinHandle<Result<()>>>,
+    worker_handle: Option<JoinHandle<Result<String>>>,
+}
+
+#[cfg(target_os = "macos")]
+impl LocalQwenLiveRuntime {
+    fn cancel_detached(mut self) {
+        self.feeder_tx.take();
+        self.source.cancel();
+        self.feeder_handle.take();
+        self.worker_handle.take();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn finalize_live_runtime(mut runtime: LocalQwenLiveRuntime) -> Result<String> {
+    runtime.feeder_tx.take();
+    if let Some(handle) = runtime.feeder_handle.take() {
+        handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("qwen live feeder panicked"))?
+            .context("qwen live feeder failed")?;
+    }
+
+    runtime.source.finish();
+
+    let worker = runtime
+        .worker_handle
+        .take()
+        .context("qwen live worker handle missing")?;
+    worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("qwen live worker panicked"))?
+        .context("qwen live worker failed")
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalQwenLivePhase {
+    Idle,
+    Buffering,
+    LiveStarting,
+    LiveRunning,
+    Finalizing,
+    LiveFinal,
+    FallbackNeeded,
+    Cancelled,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalQwenLiveFallbackReason {
+    LiveStartFailed,
+    FeederOverflow,
+    LiveWorkerFailed,
+    EmptyLiveResult,
+}
+
+#[cfg(target_os = "macos")]
+impl LocalQwenLiveFallbackReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LiveStartFailed => "live_start_failed",
+            Self::FeederOverflow => "feeder_overflow",
+            Self::LiveWorkerFailed => "live_worker_failed",
+            Self::EmptyLiveResult => "empty_live_result",
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalQwenConsumeAction {
+    None,
+    StartLive,
+    FeedLive,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalQwenStopAction {
+    DirectFinal,
+    FinishLive,
+    FallbackNeeded(LocalQwenLiveFallbackReason),
+    Cancelled,
+}
+
+#[cfg(target_os = "macos")]
+enum LocalQwenRuntimeAction {
+    None,
+    StartLive(Vec<u8>),
+    FeedLive(SyncSender<Vec<u8>>, Vec<u8>),
+}
+
+#[cfg(target_os = "macos")]
+struct LocalQwenLiveStateMachine {
+    phase: LocalQwenLivePhase,
+    total_pcm_bytes: usize,
+    fallback_reason: Option<LocalQwenLiveFallbackReason>,
+}
+
+#[cfg(target_os = "macos")]
+impl Default for LocalQwenLiveStateMachine {
+    fn default() -> Self {
+        Self {
+            phase: LocalQwenLivePhase::Idle,
+            total_pcm_bytes: 0,
+            fallback_reason: None,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl LocalQwenLiveStateMachine {
+    fn on_pcm_chunk(&mut self, n_bytes: usize) -> LocalQwenConsumeAction {
+        self.total_pcm_bytes = self.total_pcm_bytes.saturating_add(n_bytes);
+        if self.fallback_reason.is_some() {
+            return LocalQwenConsumeAction::None;
+        }
+
+        match self.phase {
+            LocalQwenLivePhase::Idle => {
+                self.phase = LocalQwenLivePhase::Buffering;
+                if self.buffer_duration_ms() >= LIVE_START_THRESHOLD_MS {
+                    self.phase = LocalQwenLivePhase::LiveStarting;
+                    LocalQwenConsumeAction::StartLive
+                } else {
+                    LocalQwenConsumeAction::None
+                }
+            }
+            LocalQwenLivePhase::Buffering => {
+                if self.buffer_duration_ms() >= LIVE_START_THRESHOLD_MS {
+                    self.phase = LocalQwenLivePhase::LiveStarting;
+                    LocalQwenConsumeAction::StartLive
+                } else {
+                    LocalQwenConsumeAction::None
+                }
+            }
+            LocalQwenLivePhase::LiveRunning => LocalQwenConsumeAction::FeedLive,
+            LocalQwenLivePhase::LiveStarting
+            | LocalQwenLivePhase::Finalizing
+            | LocalQwenLivePhase::LiveFinal
+            | LocalQwenLivePhase::FallbackNeeded
+            | LocalQwenLivePhase::Cancelled => LocalQwenConsumeAction::None,
+        }
+    }
+
+    fn on_live_worker_started(&mut self) {
+        if self.phase == LocalQwenLivePhase::LiveStarting {
+            self.phase = LocalQwenLivePhase::LiveRunning;
+        }
+    }
+
+    fn on_live_start_failed(&mut self) {
+        self.on_unhealthy(LocalQwenLiveFallbackReason::LiveStartFailed);
+    }
+
+    fn on_unhealthy(&mut self, reason: LocalQwenLiveFallbackReason) {
+        self.fallback_reason = Some(reason);
+        if matches!(
+            self.phase,
+            LocalQwenLivePhase::Idle
+                | LocalQwenLivePhase::Buffering
+                | LocalQwenLivePhase::LiveStarting
+        ) {
+            self.phase = LocalQwenLivePhase::FallbackNeeded;
+        }
+    }
+
+    fn on_stop(&mut self) -> LocalQwenStopAction {
+        if self.phase == LocalQwenLivePhase::Cancelled {
+            return LocalQwenStopAction::Cancelled;
+        }
+        if let Some(reason) = self.fallback_reason {
+            self.phase = LocalQwenLivePhase::FallbackNeeded;
+            return LocalQwenStopAction::FallbackNeeded(reason);
+        }
+
+        match self.phase {
+            LocalQwenLivePhase::Idle | LocalQwenLivePhase::Buffering => {
+                self.phase = LocalQwenLivePhase::Finalizing;
+                LocalQwenStopAction::DirectFinal
+            }
+            LocalQwenLivePhase::LiveStarting | LocalQwenLivePhase::LiveRunning => {
+                self.phase = LocalQwenLivePhase::Finalizing;
+                LocalQwenStopAction::FinishLive
+            }
+            LocalQwenLivePhase::FallbackNeeded => LocalQwenStopAction::FallbackNeeded(
+                self.fallback_reason
+                    .unwrap_or(LocalQwenLiveFallbackReason::LiveWorkerFailed),
+            ),
+            LocalQwenLivePhase::Finalizing => {
+                LocalQwenStopAction::FallbackNeeded(LocalQwenLiveFallbackReason::LiveWorkerFailed)
+            }
+            LocalQwenLivePhase::LiveFinal => LocalQwenStopAction::DirectFinal,
+            LocalQwenLivePhase::Cancelled => LocalQwenStopAction::Cancelled,
+        }
+    }
+
+    fn on_live_final(&mut self) {
+        self.phase = LocalQwenLivePhase::LiveFinal;
+        self.fallback_reason = None;
+    }
+
+    fn cancel(&mut self) {
+        self.phase = LocalQwenLivePhase::Cancelled;
+        self.fallback_reason = None;
+    }
+
+    fn buffer_duration_ms(&self) -> u64 {
+        duration_ms_from_pcm_bytes(self.total_pcm_bytes)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn duration_ms_from_pcm_bytes(bytes: usize) -> u64 {
+    (bytes as u64 / BYTES_PER_SAMPLE) * 1000 / SAMPLE_RATE_HZ
 }
 
 #[cfg(target_os = "macos")]
@@ -140,4 +668,114 @@ fn i16_le_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
             v as f32 / 32768.0
         })
         .collect()
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    const ONE_SECOND_PCM_BYTES: usize = 16_000 * 2;
+
+    #[test]
+    fn local_qwen_live_state_machine_short_recording_uses_direct_final() {
+        let mut machine = LocalQwenLiveStateMachine::default();
+
+        assert_eq!(
+            machine.on_pcm_chunk(ONE_SECOND_PCM_BYTES),
+            LocalQwenConsumeAction::None
+        );
+        assert_eq!(machine.phase, LocalQwenLivePhase::Buffering);
+        assert_eq!(machine.on_stop(), LocalQwenStopAction::DirectFinal);
+        assert_eq!(machine.phase, LocalQwenLivePhase::Finalizing);
+    }
+
+    #[test]
+    fn local_qwen_live_state_machine_fake_worker_reaches_live_final() {
+        let mut machine = LocalQwenLiveStateMachine::default();
+
+        assert_eq!(
+            machine.on_pcm_chunk(ONE_SECOND_PCM_BYTES * 2),
+            LocalQwenConsumeAction::StartLive
+        );
+        assert_eq!(machine.phase, LocalQwenLivePhase::LiveStarting);
+
+        machine.on_live_worker_started();
+        assert_eq!(machine.phase, LocalQwenLivePhase::LiveRunning);
+        assert_eq!(
+            machine.on_pcm_chunk(ONE_SECOND_PCM_BYTES),
+            LocalQwenConsumeAction::FeedLive
+        );
+
+        assert_eq!(machine.on_stop(), LocalQwenStopAction::FinishLive);
+        assert_eq!(machine.phase, LocalQwenLivePhase::Finalizing);
+        machine.on_live_final();
+        assert_eq!(machine.phase, LocalQwenLivePhase::LiveFinal);
+    }
+
+    #[test]
+    fn local_qwen_live_state_machine_feeder_overflow_preserves_full_pcm() {
+        let mut machine = LocalQwenLiveStateMachine::default();
+        assert_eq!(
+            machine.on_pcm_chunk(ONE_SECOND_PCM_BYTES * 2),
+            LocalQwenConsumeAction::StartLive
+        );
+        machine.on_live_worker_started();
+
+        machine.on_unhealthy(LocalQwenLiveFallbackReason::FeederOverflow);
+        assert_eq!(
+            machine.on_pcm_chunk(ONE_SECOND_PCM_BYTES),
+            LocalQwenConsumeAction::None
+        );
+        assert_eq!(machine.total_pcm_bytes, ONE_SECOND_PCM_BYTES * 3);
+        assert_eq!(
+            machine.on_stop(),
+            LocalQwenStopAction::FallbackNeeded(LocalQwenLiveFallbackReason::FeederOverflow)
+        );
+    }
+
+    #[test]
+    fn local_qwen_live_state_machine_start_failure_needs_fallback() {
+        let mut machine = LocalQwenLiveStateMachine::default();
+
+        assert_eq!(
+            machine.on_pcm_chunk(ONE_SECOND_PCM_BYTES * 2),
+            LocalQwenConsumeAction::StartLive
+        );
+        machine.on_live_start_failed();
+
+        assert_eq!(machine.phase, LocalQwenLivePhase::FallbackNeeded);
+        assert_eq!(
+            machine.on_stop(),
+            LocalQwenStopAction::FallbackNeeded(LocalQwenLiveFallbackReason::LiveStartFailed)
+        );
+    }
+
+    #[test]
+    fn local_qwen_live_state_machine_cancel_before_live() {
+        let mut machine = LocalQwenLiveStateMachine::default();
+
+        assert_eq!(
+            machine.on_pcm_chunk(ONE_SECOND_PCM_BYTES),
+            LocalQwenConsumeAction::None
+        );
+        machine.cancel();
+
+        assert_eq!(machine.phase, LocalQwenLivePhase::Cancelled);
+        assert_eq!(machine.on_stop(), LocalQwenStopAction::Cancelled);
+    }
+
+    #[test]
+    fn local_qwen_live_state_machine_cancel_while_live() {
+        let mut machine = LocalQwenLiveStateMachine::default();
+
+        assert_eq!(
+            machine.on_pcm_chunk(ONE_SECOND_PCM_BYTES * 2),
+            LocalQwenConsumeAction::StartLive
+        );
+        machine.on_live_worker_started();
+        machine.cancel();
+
+        assert_eq!(machine.phase, LocalQwenLivePhase::Cancelled);
+        assert_eq!(machine.on_stop(), LocalQwenStopAction::Cancelled);
+    }
 }

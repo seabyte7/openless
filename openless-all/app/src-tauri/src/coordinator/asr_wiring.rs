@@ -308,12 +308,13 @@ pub(super) async fn build_local_qwen3(
     );
     // 加载完成（含缓存命中刷新 last_used）后推一次状态，前端零轮询更新「已加载」。
     emit_local_asr_engine_status(inner);
-    Ok(Arc::new(crate::asr::local::LocalQwenAsr::new(
+    Ok(Arc::new(crate::asr::local::LocalQwenAsr::new_with_mode(
         app,
         loaded.engine,
         model_id.as_str().to_string(),
         model_dir,
         loaded.outcome,
+        crate::asr::local::LocalQwenSessionMode::BatchOnly,
     )))
 }
 

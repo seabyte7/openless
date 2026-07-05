@@ -1936,20 +1936,79 @@ fn fail_dictation(
 struct TranscribeFail {
     user_msg: String,
     err: String,
+    retryable: bool,
 }
 
 impl TranscribeFail {
     fn new(user_msg: String, err: String) -> Self {
-        Self { user_msg, err }
+        let retryable = asr_error_is_retryable(&err);
+        Self {
+            user_msg,
+            err,
+            retryable,
+        }
     }
 }
 
-/// 自动静默重试的最大次数（不含首次转写）。失败/超时多为网络或服务端瞬时抖动，重试几次
-/// 往往就能拿回这段语音；上限避免在永久性故障（如鉴权失败）上空耗太久。
-const SILENT_RETRY_MAX: u32 = 2;
+/// 自动静默重试的最大次数（不含首次转写）。只对网络/超时类瞬时错误重试一次；
+/// 永久性故障（鉴权、权限、协议错误、空音频）不重试，避免额外卡住用户。
+const SILENT_RETRY_MAX: u32 = 1;
 /// 每次重试前的线性退避基数：第 N 次重试前等 `SILENT_RETRY_BACKOFF_MS * N` 毫秒，给抖动的
 /// 网络/服务端一点缓冲再打。
 const SILENT_RETRY_BACKOFF_MS: u64 = 500;
+
+fn asr_error_is_retryable(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    let non_retryable_markers = [
+        "credentials missing",
+        "api key missing",
+        "凭据被拒",
+        "unauthorized",
+        "forbidden",
+        " 401",
+        " 403",
+        "auth",
+        "permission",
+        "权限被拒",
+        "未获授权",
+        "no speech",
+        "empty transcript",
+        "protocol",
+        "decode failed",
+        "sequence",
+        "45000000",
+    ];
+    if non_retryable_markers
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+
+    let retryable_markers = [
+        "timeout",
+        "timed out",
+        "connection failed",
+        "connection reset",
+        "network",
+        "websocket",
+        "closed",
+        "send failed",
+        "send timed out",
+        "audio drain timed out",
+        "tls",
+        "eof",
+        "45000081",
+        "too many requests",
+        " 429",
+        " 502",
+        " 503",
+        " 504",
+    ];
+    retryable_markers
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
 
 /// 归档 wav 是 16k/mono/16-bit、固定 44 字节标准头（asr::wav::encode_wav_16k_mono）；取出
 /// PCM 负载。长度 <= 44（空/损坏）返回 None。
@@ -1984,7 +2043,12 @@ async fn retranscribe_pcm_via_inner(inner: &Arc<Inner>, pcm: Vec<u8>) -> Result<
 async fn try_silent_retranscribe(
     inner: &Arc<Inner>,
     session_id: SessionId,
+    fail: &TranscribeFail,
 ) -> Option<RawTranscript> {
+    if !fail.retryable {
+        log::info!("[coord] 自动静默重试跳过：非瞬时 ASR 错误 ({})", fail.err);
+        return None;
+    }
     if !inner.audio_archive_active.load(Ordering::Relaxed) {
         return None; // 没归档音频，无从重试
     }
@@ -2065,29 +2129,32 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             debug_assert!(uses_global_timeout);
             if let Err(e) = asr.send_last_frame().await {
                 log::error!("[coord] send last frame failed: {e}");
-            }
-            // 添加全局超时保护：防止 await_final_result() 永远挂起
-            let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
-            match tokio::time::timeout(timeout_duration, asr.await_final_result()).await {
-                Ok(Ok(r)) => Ok(r),
-                Ok(Err(e)) => {
-                    log::error!("[coord] await final failed: {e}");
-                    // 关闭 WebSocket 连接，避免流式 ASR 资源泄漏
-                    asr.cancel();
-                    Err(TranscribeFail::new(format!("识别失败: {e}"), e.to_string()))
-                }
-                Err(_) => {
-                    // 全局超时：最后的防线
-                    log::error!(
-                        "[coord] 全局超时 {} 秒 - 强制恢复",
-                        COORDINATOR_GLOBAL_TIMEOUT_SECS
-                    );
-                    // 清理 ASR session，避免资源泄漏
-                    asr.cancel();
-                    Err(TranscribeFail::new(
-                        "识别超时".to_string(),
-                        "global timeout".to_string(),
-                    ))
+                Err(TranscribeFail::new(format!("识别失败: {e}"), e.to_string()))
+            } else {
+                // 添加全局超时保护：防止 await_final_result() 永远挂起
+                let timeout_duration =
+                    std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
+                match tokio::time::timeout(timeout_duration, asr.await_final_result()).await {
+                    Ok(Ok(r)) => Ok(r),
+                    Ok(Err(e)) => {
+                        log::error!("[coord] await final failed: {e}");
+                        // 关闭 WebSocket 连接，避免流式 ASR 资源泄漏
+                        asr.cancel();
+                        Err(TranscribeFail::new(format!("识别失败: {e}"), e.to_string()))
+                    }
+                    Err(_) => {
+                        // 全局超时：最后的防线
+                        log::error!(
+                            "[coord] 全局超时 {} 秒 - 强制恢复",
+                            COORDINATOR_GLOBAL_TIMEOUT_SECS
+                        );
+                        // 清理 ASR session，避免资源泄漏
+                        asr.cancel();
+                        Err(TranscribeFail::new(
+                            "识别超时".to_string(),
+                            "global timeout".to_string(),
+                        ))
+                    }
                 }
             }
         }
@@ -2123,7 +2190,13 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         }
         ActiveAsr::Mimo(m) => {
             debug_assert!(uses_global_timeout);
-            let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
+            let audio_secs = (m.buffer_duration_ms() as f64) / 1000.0;
+            let timeout_duration = mimo_transcribe_timeout(audio_secs);
+            log::info!(
+                "[coord] MiMo ASR transcribe: audio={:.2}s timeout={}s",
+                audio_secs,
+                timeout_duration.as_secs()
+            );
             match tokio::time::timeout(timeout_duration, m.transcribe()).await {
                 Ok(Ok(r)) => Ok(r),
                 Ok(Err(e)) => {
@@ -2132,8 +2205,9 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                 }
                 Err(_) => {
                     log::error!(
-                        "[coord] MiMo ASR 全局超时 {} 秒",
-                        COORDINATOR_GLOBAL_TIMEOUT_SECS
+                        "[coord] MiMo ASR 动态超时 {}s（音频 {:.2}s）",
+                        timeout_duration.as_secs(),
+                        audio_secs
                     );
                     Err(TranscribeFail::new(
                         "识别超时".to_string(),
@@ -2146,26 +2220,30 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             debug_assert!(uses_global_timeout);
             if let Err(e) = asr.send_last_frame().await {
                 log::error!("[coord] Bailian send last frame failed: {e}");
-            }
-            let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
-            match tokio::time::timeout(timeout_duration, asr.await_final_result()).await {
-                Ok(Ok(r)) => Ok(r),
-                Ok(Err(e)) => {
-                    log::error!("[coord] Bailian await final failed: {e}");
-                    // 关闭 WebSocket 连接，避免流式 ASR 资源泄漏
-                    asr.cancel();
-                    Err(TranscribeFail::new(format!("识别失败: {e}"), e.to_string()))
-                }
-                Err(_) => {
-                    log::error!(
-                        "[coord] Bailian 全局超时 {} 秒",
-                        COORDINATOR_GLOBAL_TIMEOUT_SECS
-                    );
-                    asr.cancel();
-                    Err(TranscribeFail::new(
-                        "识别超时".to_string(),
-                        "bailian global timeout".to_string(),
-                    ))
+                asr.cancel();
+                Err(TranscribeFail::new(format!("识别失败: {e}"), e.to_string()))
+            } else {
+                let timeout_duration =
+                    std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
+                match tokio::time::timeout(timeout_duration, asr.await_final_result()).await {
+                    Ok(Ok(r)) => Ok(r),
+                    Ok(Err(e)) => {
+                        log::error!("[coord] Bailian await final failed: {e}");
+                        // 关闭 WebSocket 连接，避免流式 ASR 资源泄漏
+                        asr.cancel();
+                        Err(TranscribeFail::new(format!("识别失败: {e}"), e.to_string()))
+                    }
+                    Err(_) => {
+                        log::error!(
+                            "[coord] Bailian 全局超时 {} 秒",
+                            COORDINATOR_GLOBAL_TIMEOUT_SECS
+                        );
+                        asr.cancel();
+                        Err(TranscribeFail::new(
+                            "识别超时".to_string(),
+                            "bailian global timeout".to_string(),
+                        ))
+                    }
                 }
             }
         }
@@ -2356,7 +2434,7 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     // 继续走润色/插入；彻底失败才 fail_dictation 保留录音 + 报错（音频仍在，可去历史手动重转）。
     let raw = match transcribe_outcome {
         Ok(raw) => raw,
-        Err(fail) => match try_silent_retranscribe(inner, current_session_id).await {
+        Err(fail) => match try_silent_retranscribe(inner, current_session_id, &fail).await {
             Some(raw) => raw,
             None => {
                 return fail_dictation(
@@ -2994,10 +3072,10 @@ fn eligible_polish_context_turns(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_typed_prefix, batch_asr_chunk_limit_ms, build_transcribe_failed_session,
-        default_done_message, drain_streaming_insert_deltas_with, eligible_polish_context_turns,
-        finalize_polished_text, flush_streaming_insert_buffer_with, pcm_duration_ms,
-        pcm_from_wav_bytes, streaming_insert_eligible,
+        append_typed_prefix, asr_error_is_retryable, batch_asr_chunk_limit_ms,
+        build_transcribe_failed_session, default_done_message, drain_streaming_insert_deltas_with,
+        eligible_polish_context_turns, finalize_polished_text, flush_streaming_insert_buffer_with,
+        pcm_duration_ms, pcm_from_wav_bytes, streaming_insert_eligible,
     };
     #[cfg(target_os = "macos")]
     use super::{macos_keyless_dictation_provider, MacosKeylessDictationProvider};
@@ -3490,6 +3568,33 @@ mod tests {
         assert_eq!(batch_asr_chunk_limit_ms("siliconflow"), None);
         assert_eq!(batch_asr_chunk_limit_ms("groq"), None);
         assert_eq!(batch_asr_chunk_limit_ms("volcengine"), None);
+    }
+
+    #[test]
+    fn asr_retry_classifier_retries_transient_network_failures() {
+        for error in [
+            "send timed out after 5000 ms",
+            "audio drain timed out: 3 pending frames after 2000 ms",
+            "connection failed: TLS EOF",
+            "ASR error 45000081: Timeout waiting next packet",
+            "Whisper API error 503: busy",
+        ] {
+            assert!(asr_error_is_retryable(error), "{error}");
+        }
+    }
+
+    #[test]
+    fn asr_retry_classifier_skips_permanent_failures() {
+        for error in [
+            "credentials missing",
+            "Whisper API key missing",
+            "凭据被拒（403）",
+            "语音识别权限被拒绝",
+            "decode failed: bad frame",
+            "ASR error 45000000: sequence mismatch",
+        ] {
+            assert!(!asr_error_is_retryable(error), "{error}");
+        }
     }
 
     #[test]

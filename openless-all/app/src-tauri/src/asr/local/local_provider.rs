@@ -51,7 +51,7 @@ impl LocalQwenAsr {
     /// stop 时调用：把 buffer 的 i16 PCM 转 f32，跑流式转写，token 实时
     /// 通过事件吐到前端胶囊；最终文本一起返回供 polish/insert。
     pub async fn transcribe(self: Arc<Self>) -> Result<RawTranscript> {
-        let pcm_bytes = std::mem::take(&mut *self.buffer.lock());
+        let pcm_bytes = self.buffer.lock().clone();
         if pcm_bytes.is_empty() {
             return Ok(RawTranscript {
                 text: String::new(),
@@ -75,6 +75,9 @@ impl LocalQwenAsr {
                 log::warn!("[local-asr] emit token failed: {e}");
             }
         }));
+        let _token_handler_guard = TokenHandlerGuard {
+            engine: Arc::clone(&self.engine),
+        };
 
         // qwen_transcribe_stream 是阻塞调用；用 spawn_blocking 防止占住 tokio runtime。
         // 用 tauri::async_runtime::spawn_blocking 而非 tokio 的 —— 同 download.rs 注释，
@@ -87,8 +90,7 @@ impl LocalQwenAsr {
                 .context("transcribe spawn_blocking join 失败")?
                 .context("qwen_transcribe_stream 失败")?;
 
-        // 解绑回调，避免 idle 期 C 端任何后续触发。
-        self.engine.set_token_handler::<fn(&str)>(None);
+        self.buffer.lock().clear();
 
         Ok(RawTranscript { text, duration_ms })
     }
@@ -114,4 +116,16 @@ fn i16_le_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
             v as f32 / 32768.0
         })
         .collect()
+}
+
+#[cfg(target_os = "macos")]
+struct TokenHandlerGuard {
+    engine: Arc<QwenAsrEngine>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for TokenHandlerGuard {
+    fn drop(&mut self) {
+        self.engine.set_token_handler::<fn(&str)>(None);
+    }
 }

@@ -31,6 +31,9 @@ pub const DEFAULT_MODEL: &str = "fun-asr-realtime";
 pub const TARGET_AUDIO_CHUNK_BYTES: usize = 3_200;
 const BYTES_PER_MS: u64 = 32;
 const FINAL_RESULT_TIMEOUT: Duration = Duration::from_secs(12);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const TASK_START_TIMEOUT: Duration = Duration::from_secs(5);
+const SEND_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
@@ -62,7 +65,7 @@ impl BailianCredentials {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum BailianASRError {
     #[error("credentials missing")]
     CredentialsMissing,
@@ -70,6 +73,8 @@ pub enum BailianASRError {
     ConnectionFailed(String),
     #[error("send failed: {0}")]
     SendFailed(String),
+    #[error("send timed out after {timeout_ms} ms")]
+    SendTimeout { timeout_ms: u64 },
     #[error("task failed: {0}")]
     TaskFailed(String),
     #[error("no final result")]
@@ -79,7 +84,10 @@ pub enum BailianASRError {
 }
 
 enum SendItem {
-    Audio(Vec<u8>),
+    Audio {
+        chunk: Vec<u8>,
+        done: Option<oneshot::Sender<Result<(), BailianASRError>>>,
+    },
     Finish(oneshot::Sender<Result<(), BailianASRError>>),
 }
 
@@ -95,6 +103,7 @@ struct SyncState {
     start: Option<Instant>,
     final_tx: Option<oneshot::Sender<Result<RawTranscript, BailianASRError>>>,
     send_tx: Option<mpsc::UnboundedSender<SendItem>>,
+    terminal_error: Option<BailianASRError>,
     /// sentence_id → text，按 sentence_id 排序拼接得到最终文本。
     /// 同一 sentence_id 的后到结果覆盖前一个，消除累积文本导致的重复。
     final_segments: BTreeMap<i64, String>,
@@ -139,8 +148,14 @@ impl BailianRealtimeASR {
                 .map_err(|e| BailianASRError::ConnectionFailed(e.to_string()))?,
         );
 
-        let (ws, _resp) = connect_async(request)
+        let (ws, _resp) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request))
             .await
+            .map_err(|_| {
+                BailianASRError::ConnectionFailed(format!(
+                    "connection timed out after {} ms",
+                    CONNECT_TIMEOUT.as_millis()
+                ))
+            })?
             .map_err(|e| BailianASRError::ConnectionFailed(e.to_string()))?;
         let (write, read) = ws.split();
         *self.writer.lock().await = Some(write);
@@ -160,26 +175,42 @@ impl BailianRealtimeASR {
 
         let writer_for_worker = Arc::clone(&self.writer);
         let task_id_for_worker = task_id.clone();
+        let weak_for_worker = Arc::downgrade(self);
         tokio::spawn(async move {
             while let Some(item) = send_rx.recv().await {
                 match item {
-                    SendItem::Audio(chunk) => {
+                    SendItem::Audio { chunk, done } => {
                         if let Err(e) = send_binary(&writer_for_worker, chunk).await {
                             log::error!("[bailian-asr] audio frame send failed: {e}");
+                            send_ack(done, Err(e.clone()));
+                            if let Some(this) = weak_for_worker.upgrade() {
+                                this.finish_error(e.clone());
+                            }
+                            drain_send_queue_with_error(&mut send_rx, e);
+                            break;
+                        } else {
+                            send_ack(done, Ok(()));
                         }
                     }
                     SendItem::Finish(done) => {
                         let result =
                             send_text(&writer_for_worker, finish_task_message(&task_id_for_worker))
-                                .await
-                                .map_err(|e| BailianASRError::SendFailed(e.to_string()));
+                                .await;
+                        if let Err(e) = result.clone() {
+                            if let Some(this) = weak_for_worker.upgrade() {
+                                this.finish_error(e.clone());
+                            }
+                            drain_send_queue_with_error(&mut send_rx, e.clone());
+                            let _ = done.send(Err(e));
+                            break;
+                        }
                         let _ = done.send(result);
                     }
                 }
             }
         });
 
-        send_text(
+        if let Err(error) = send_text(
             &self.writer,
             run_task_message(
                 &task_id,
@@ -187,7 +218,11 @@ impl BailianRealtimeASR {
                 self.credentials.vocabulary_id.as_deref(),
             ),
         )
-        .await?;
+        .await
+        {
+            self.finish_error(error.clone());
+            return Err(error);
+        }
 
         let weak_self = Arc::downgrade(self);
         tokio::spawn(async move {
@@ -222,6 +257,9 @@ impl BailianRealtimeASR {
     }
 
     pub async fn send_last_frame(&self) -> Result<(), BailianASRError> {
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
         let started = self.task_started.notified();
         tokio::pin!(started);
         started.as_mut().enable();
@@ -230,9 +268,15 @@ impl BailianRealtimeASR {
             st.task_started || st.task_finished
         };
         if !ready {
-            tokio::time::timeout(Duration::from_secs(5), started)
+            tokio::time::timeout(TASK_START_TIMEOUT, started)
                 .await
                 .map_err(|_| BailianASRError::FinalResultTimeout)?;
+        }
+        if let Some(error) = self.terminal_error() {
+            return Err(error);
+        }
+        if self.state.lock().task_finished {
+            return Ok(());
         }
         let (send_tx, tail_chunks) = {
             let mut st = self.state.lock();
@@ -252,14 +296,17 @@ impl BailianRealtimeASR {
             return Ok(());
         };
         for chunk in tail_chunks {
-            let _ = send_tx.send(SendItem::Audio(chunk));
+            send_audio_and_wait(&send_tx, chunk).await?;
         }
         let (done_tx, done_rx) = oneshot::channel();
         send_tx
             .send(SendItem::Finish(done_tx))
             .map_err(|_| BailianASRError::SendFailed("send worker closed".to_string()))?;
-        done_rx
+        tokio::time::timeout(SEND_FRAME_TIMEOUT, done_rx)
             .await
+            .map_err(|_| BailianASRError::SendTimeout {
+                timeout_ms: SEND_FRAME_TIMEOUT.as_millis() as u64,
+            })?
             .map_err(|_| BailianASRError::SendFailed("finish ack dropped".to_string()))?
     }
 
@@ -282,6 +329,7 @@ impl BailianRealtimeASR {
         st.final_tx.take();
         st.task_finished = true;
         drop(st);
+        self.task_started.notify_waiters();
         let writer = Arc::clone(&self.writer);
         if let Ok(handle) = Handle::try_current() {
             handle.spawn(async move {
@@ -350,12 +398,21 @@ impl BailianRealtimeASR {
             let chunks = drain_audio_chunks(&mut st.audio_scratch);
             (send_tx, chunks)
         };
+        let mut send_error = None;
         if let Some(tx) = send_tx {
             for chunk in chunks {
-                let _ = tx.send(SendItem::Audio(chunk));
+                if tx.send(SendItem::Audio { chunk, done: None }).is_err() {
+                    send_error = Some(BailianASRError::SendFailed(
+                        "send worker closed".to_string(),
+                    ));
+                    break;
+                }
             }
         }
         self.task_started.notify_waiters();
+        if let Some(error) = send_error {
+            self.finish_error(error);
+        }
     }
 
     fn record_result(&self, value: &Value) {
@@ -470,12 +527,14 @@ impl BailianRealtimeASR {
                 return;
             }
             st.task_finished = true;
+            st.terminal_error = Some(error.clone());
             st.send_tx.take();
             st.final_tx.take()
         };
         if let Some(tx) = tx {
             let _ = tx.send(Err(error));
         }
+        self.task_started.notify_waiters();
         self.close_on_runtime();
     }
 
@@ -486,6 +545,10 @@ impl BailianRealtimeASR {
                 let _ = close_writer(&writer).await;
             });
         }
+    }
+
+    fn terminal_error(&self) -> Option<BailianASRError> {
+        self.state.lock().terminal_error.clone()
     }
 }
 
@@ -507,7 +570,12 @@ impl AudioConsumer for BailianRealtimeASR {
         };
         if let Some(tx) = send_tx {
             for chunk in chunks {
-                let _ = tx.send(SendItem::Audio(chunk));
+                if tx.send(SendItem::Audio { chunk, done: None }).is_err() {
+                    self.finish_error(BailianASRError::SendFailed(
+                        "send worker closed".to_string(),
+                    ));
+                    return;
+                }
             }
         }
     }
@@ -519,6 +587,48 @@ fn drain_audio_chunks(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
         chunks.push(buffer.drain(..TARGET_AUDIO_CHUNK_BYTES).collect());
     }
     chunks
+}
+
+async fn send_audio_and_wait(
+    send_tx: &mpsc::UnboundedSender<SendItem>,
+    chunk: Vec<u8>,
+) -> Result<(), BailianASRError> {
+    let (done_tx, done_rx) = oneshot::channel();
+    send_tx
+        .send(SendItem::Audio {
+            chunk,
+            done: Some(done_tx),
+        })
+        .map_err(|_| BailianASRError::SendFailed("send worker closed".to_string()))?;
+    tokio::time::timeout(SEND_FRAME_TIMEOUT, done_rx)
+        .await
+        .map_err(|_| BailianASRError::SendTimeout {
+            timeout_ms: SEND_FRAME_TIMEOUT.as_millis() as u64,
+        })?
+        .map_err(|_| BailianASRError::SendFailed("audio ack dropped".to_string()))?
+}
+
+fn send_ack(
+    done: Option<oneshot::Sender<Result<(), BailianASRError>>>,
+    result: Result<(), BailianASRError>,
+) {
+    if let Some(done) = done {
+        let _ = done.send(result);
+    }
+}
+
+fn drain_send_queue_with_error(
+    send_rx: &mut mpsc::UnboundedReceiver<SendItem>,
+    error: BailianASRError,
+) {
+    while let Ok(item) = send_rx.try_recv() {
+        match item {
+            SendItem::Audio { done, .. } => send_ack(done, Err(error.clone())),
+            SendItem::Finish(done) => {
+                let _ = done.send(Err(error.clone()));
+            }
+        }
+    }
 }
 
 /// 带重叠检测的文本段拼接：如果后一段的开头与前一段的末尾存在重叠，
@@ -589,27 +699,39 @@ fn finish_task_message(task_id: &str) -> String {
 }
 
 async fn send_text(writer: &SharedWriter, text: String) -> Result<(), BailianASRError> {
-    let mut guard = writer.lock().await;
-    let Some(ws) = guard.as_mut() else {
-        return Err(BailianASRError::ConnectionFailed(
-            "websocket writer not available".to_string(),
-        ));
-    };
-    ws.send(Message::Text(text))
-        .await
-        .map_err(|e| BailianASRError::SendFailed(e.to_string()))
+    tokio::time::timeout(SEND_FRAME_TIMEOUT, async {
+        let mut guard = writer.lock().await;
+        let Some(ws) = guard.as_mut() else {
+            return Err(BailianASRError::ConnectionFailed(
+                "websocket writer not available".to_string(),
+            ));
+        };
+        ws.send(Message::Text(text))
+            .await
+            .map_err(|e| BailianASRError::SendFailed(e.to_string()))
+    })
+    .await
+    .map_err(|_| BailianASRError::SendTimeout {
+        timeout_ms: SEND_FRAME_TIMEOUT.as_millis() as u64,
+    })?
 }
 
 async fn send_binary(writer: &SharedWriter, data: Vec<u8>) -> Result<(), BailianASRError> {
-    let mut guard = writer.lock().await;
-    let Some(ws) = guard.as_mut() else {
-        return Err(BailianASRError::ConnectionFailed(
-            "websocket writer not available".to_string(),
-        ));
-    };
-    ws.send(Message::Binary(data))
-        .await
-        .map_err(|e| BailianASRError::SendFailed(e.to_string()))
+    tokio::time::timeout(SEND_FRAME_TIMEOUT, async {
+        let mut guard = writer.lock().await;
+        let Some(ws) = guard.as_mut() else {
+            return Err(BailianASRError::ConnectionFailed(
+                "websocket writer not available".to_string(),
+            ));
+        };
+        ws.send(Message::Binary(data))
+            .await
+            .map_err(|e| BailianASRError::SendFailed(e.to_string()))
+    })
+    .await
+    .map_err(|_| BailianASRError::SendTimeout {
+        timeout_ms: SEND_FRAME_TIMEOUT.as_millis() as u64,
+    })?
 }
 
 async fn close_writer(writer: &SharedWriter) -> Result<(), BailianASRError> {
@@ -662,6 +784,21 @@ mod tests {
             model: String::new(),
             vocabulary_id: None,
         })
+    }
+
+    #[tokio::test]
+    async fn send_last_frame_returns_terminal_error_without_waiting() {
+        let asr = create_test_asr();
+        asr.state.lock().terminal_error = Some(BailianASRError::SendFailed(
+            "worker send failed".to_string(),
+        ));
+
+        let result = asr.send_last_frame().await;
+
+        assert!(matches!(
+            result,
+            Err(BailianASRError::SendFailed(message)) if message == "worker send failed"
+        ));
     }
 
     // ---- merge_segments ----

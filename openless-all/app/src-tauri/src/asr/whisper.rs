@@ -4,12 +4,14 @@
 use anyhow::{Context, Result};
 use base64::Engine;
 use parking_lot::Mutex;
+use std::time::Duration;
 
 use crate::asr::wav::encode_wav_16k_mono;
 use crate::asr::RawTranscript;
 
 const PCM_SAMPLE_RATE_HZ: u64 = 16_000;
 const PCM_BYTES_PER_SAMPLE: usize = 2;
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Whisper の `prompt` パラメータの安全側上限（文字数）。
 ///
@@ -140,7 +142,10 @@ impl WhisperBatchASR {
             .collect();
         let wav = encode_wav_16k_mono(&samples);
         let url = transcription_url(&self.base_url)?;
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(HTTP_REQUEST_TIMEOUT)
+            .build()
+            .context("build Whisper HTTP client")?;
 
         let request = match self.request_format {
             AsrRequestFormat::Multipart => {

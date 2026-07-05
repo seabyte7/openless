@@ -216,6 +216,8 @@ pub(super) async fn transcribe_overlay_dictation_asr(
             debug_assert!(uses_global_timeout);
             if let Err(error) = asr.send_last_frame().await {
                 log::error!("[coord] overlay QA: send last frame failed: {error}");
+                asr.cancel();
+                return Err(error.to_string());
             }
             let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
             match tokio::time::timeout(timeout_duration, asr.await_final_result()).await {
@@ -231,6 +233,8 @@ pub(super) async fn transcribe_overlay_dictation_asr(
             debug_assert!(uses_global_timeout);
             if let Err(error) = asr.send_last_frame().await {
                 log::error!("[coord] overlay QA: Bailian send last frame failed: {error}");
+                asr.cancel();
+                return Err(error.to_string());
             }
             let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
             match tokio::time::timeout(timeout_duration, asr.await_final_result()).await {
@@ -244,7 +248,8 @@ pub(super) async fn transcribe_overlay_dictation_asr(
         }
         ActiveAsr::Whisper(whisper) => {
             debug_assert!(uses_global_timeout);
-            let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
+            let audio_secs = (whisper.buffer_duration_ms() as f64) / 1000.0;
+            let timeout_duration = whisper_transcribe_timeout(audio_secs);
             match tokio::time::timeout(timeout_duration, whisper.transcribe()).await {
                 Ok(Ok(raw)) => Ok(raw),
                 Ok(Err(error)) => Err(error.to_string()),
@@ -253,7 +258,8 @@ pub(super) async fn transcribe_overlay_dictation_asr(
         }
         ActiveAsr::Mimo(mimo) => {
             debug_assert!(uses_global_timeout);
-            let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
+            let audio_secs = (mimo.buffer_duration_ms() as f64) / 1000.0;
+            let timeout_duration = mimo_transcribe_timeout(audio_secs);
             match tokio::time::timeout(timeout_duration, mimo.transcribe()).await {
                 Ok(Ok(raw)) => Ok(raw),
                 Ok(Err(error)) => Err(error.to_string()),
@@ -323,12 +329,9 @@ pub(super) async fn transcribe_overlay_dictation_asr(
         #[cfg(target_os = "macos")]
         ActiveAsr::AppleSpeech(local) => {
             debug_assert!(uses_global_timeout);
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS),
-                local.transcribe(),
-            )
-            .await
-            {
+            let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
+            let timeout_duration = local_qwen_transcribe_timeout(audio_secs);
+            match tokio::time::timeout(timeout_duration, local.transcribe()).await {
                 Ok(Ok(raw)) => Ok(raw),
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(_) => Err("apple speech transcribe timeout".to_string()),
@@ -739,6 +742,9 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
             debug_assert!(uses_global_timeout);
             if let Err(e) = asr.send_last_frame().await {
                 log::error!("[coord] QA: send last frame failed: {e}");
+                asr.cancel();
+                finish_qa_with_error(inner, format!("识别失败: {e}"));
+                return Err(e.to_string());
             }
             let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
             match tokio::time::timeout(timeout_duration, asr.await_final_result()).await {
@@ -763,6 +769,9 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
             debug_assert!(uses_global_timeout);
             if let Err(e) = asr.send_last_frame().await {
                 log::error!("[coord] QA: Bailian send last frame failed: {e}");
+                asr.cancel();
+                finish_qa_with_error(inner, format!("识别失败: {e}"));
+                return Err(e.to_string());
             }
             let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
             match tokio::time::timeout(timeout_duration, asr.await_final_result()).await {
@@ -785,7 +794,13 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
         }
         ActiveAsr::Whisper(w) => {
             debug_assert!(uses_global_timeout);
-            let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
+            let audio_secs = (w.buffer_duration_ms() as f64) / 1000.0;
+            let timeout_duration = whisper_transcribe_timeout(audio_secs);
+            log::info!(
+                "[coord] QA Whisper transcribe: audio={:.2}s timeout={}s",
+                audio_secs,
+                timeout_duration.as_secs()
+            );
             match tokio::time::timeout(timeout_duration, w.transcribe()).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
@@ -795,8 +810,9 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
                 }
                 Err(_) => {
                     log::error!(
-                        "[coord] QA: whisper 全局超时 {} 秒",
-                        COORDINATOR_GLOBAL_TIMEOUT_SECS
+                        "[coord] QA: whisper 动态超时 {}s（音频 {:.2}s）",
+                        timeout_duration.as_secs(),
+                        audio_secs
                     );
                     finish_qa_with_error(inner, "识别超时".to_string());
                     return Err("whisper global timeout".to_string());
@@ -805,7 +821,13 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
         }
         ActiveAsr::Mimo(m) => {
             debug_assert!(uses_global_timeout);
-            let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
+            let audio_secs = (m.buffer_duration_ms() as f64) / 1000.0;
+            let timeout_duration = mimo_transcribe_timeout(audio_secs);
+            log::info!(
+                "[coord] QA MiMo ASR transcribe: audio={:.2}s timeout={}s",
+                audio_secs,
+                timeout_duration.as_secs()
+            );
             match tokio::time::timeout(timeout_duration, m.transcribe()).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
@@ -815,8 +837,9 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
                 }
                 Err(_) => {
                     log::error!(
-                        "[coord] QA: MiMo ASR 全局超时 {} 秒",
-                        COORDINATOR_GLOBAL_TIMEOUT_SECS
+                        "[coord] QA: MiMo ASR 动态超时 {}s（音频 {:.2}s）",
+                        timeout_duration.as_secs(),
+                        audio_secs
                     );
                     finish_qa_with_error(inner, "识别超时".to_string());
                     return Err("mimo global timeout".to_string());
@@ -908,7 +931,13 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         ActiveAsr::AppleSpeech(local) => {
             debug_assert!(uses_global_timeout);
-            let timeout_duration = std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS);
+            let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
+            let timeout_duration = local_qwen_transcribe_timeout(audio_secs);
+            log::info!(
+                "[coord] QA Apple Speech transcribe: audio={:.2}s timeout={}s",
+                audio_secs,
+                timeout_duration.as_secs()
+            );
             match tokio::time::timeout(timeout_duration, local.transcribe()).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
@@ -917,7 +946,10 @@ pub(super) async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
                     return Err(e.to_string());
                 }
                 Err(_) => {
-                    log::error!("[coord] QA Apple Speech transcribe timeout");
+                    log::error!(
+                        "[coord] QA Apple Speech transcribe timeout after {}s",
+                        timeout_duration.as_secs()
+                    );
                     finish_qa_with_error(inner, "本地识别超时".to_string());
                     return Err("apple speech transcribe timeout".to_string());
                 }

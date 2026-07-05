@@ -1575,14 +1575,20 @@ impl Coordinator {
                     .map_err(|_| "重新转录超时".to_string())?
                     .map_err(|e| e.to_string())?
             }
-            ActiveAsr::Whisper(w) => tokio::time::timeout(timeout, w.transcribe())
-                .await
-                .map_err(|_| "重新转录超时".to_string())?
-                .map_err(|e| e.to_string())?,
-            ActiveAsr::Mimo(m) => tokio::time::timeout(timeout, m.transcribe())
-                .await
-                .map_err(|_| "重新转录超时".to_string())?
-                .map_err(|e| e.to_string())?,
+            ActiveAsr::Whisper(w) => {
+                let dur = whisper_transcribe_timeout((w.buffer_duration_ms() as f64) / 1000.0);
+                tokio::time::timeout(dur, w.transcribe())
+                    .await
+                    .map_err(|_| "重新转录超时".to_string())?
+                    .map_err(|e| e.to_string())?
+            }
+            ActiveAsr::Mimo(m) => {
+                let dur = mimo_transcribe_timeout((m.buffer_duration_ms() as f64) / 1000.0);
+                tokio::time::timeout(dur, m.transcribe())
+                    .await
+                    .map_err(|_| "重新转录超时".to_string())?
+                    .map_err(|e| e.to_string())?
+            }
             #[cfg(target_os = "windows")]
             ActiveAsr::FoundryLocalWhisper(local) => local
                 .transcribe(foundry_audio_transcribe_timeout_duration())
@@ -1606,10 +1612,14 @@ impl Coordinator {
                 out
             }
             #[cfg(target_os = "macos")]
-            ActiveAsr::AppleSpeech(local) => tokio::time::timeout(timeout, local.transcribe())
-                .await
-                .map_err(|_| "重新转录超时".to_string())?
-                .map_err(|e| e.to_string())?,
+            ActiveAsr::AppleSpeech(local) => {
+                let dur =
+                    local_qwen_transcribe_timeout((local.buffer_duration_ms() as f64) / 1000.0);
+                tokio::time::timeout(dur, local.transcribe())
+                    .await
+                    .map_err(|_| "重新转录超时".to_string())?
+                    .map_err(|e| e.to_string())?
+            }
         };
         Ok(raw.text)
     }
@@ -2465,6 +2475,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mimo_timeout_uses_cloud_batch_budget() {
+        assert_eq!(
+            mimo_transcribe_timeout(60.0),
+            whisper_transcribe_timeout(60.0)
+        );
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn foundry_release_uses_foundry_keep_loaded_preference() {
@@ -3057,6 +3075,10 @@ fn whisper_transcribe_timeout(audio_secs: f64) -> std::time::Duration {
         .saturating_add(20)
         .max(COORDINATOR_GLOBAL_TIMEOUT_SECS);
     std::time::Duration::from_secs(secs)
+}
+
+fn mimo_transcribe_timeout(audio_secs: f64) -> std::time::Duration {
+    whisper_transcribe_timeout(audio_secs)
 }
 
 /// sherpa-onnx offline batch 暂与 Foundry 同档；后续按 Windows 真机 CPU/模型

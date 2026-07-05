@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use parking_lot::Mutex;
 use serde_json::Value;
+use std::time::Duration;
 
 use crate::asr::wav::encode_wav_16k_mono;
 use crate::asr::RawTranscript;
@@ -17,6 +18,7 @@ const PCM_BYTES_PER_SAMPLE: usize = 2;
 // 官方限制：Base64 后的音频数据不能超过 10MB。180s 的 16k/16-bit/mono WAV
 // Base64 后约 7.7MB，给 JSON/data-url 前缀和厂商侧 MB 口径差异留余量。
 const MIMO_MAX_CHUNK_DURATION_MS: u64 = 180_000;
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 pub const PROVIDER_ID: &str = "xiaomi-mimo-asr";
 pub const DEFAULT_ENDPOINT: &str = "https://api.xiaomimimo.com/v1";
 pub const DEFAULT_MODEL: &str = "mimo-v2.5-asr";
@@ -54,6 +56,10 @@ impl MimoBatchASR {
         result
     }
 
+    pub fn buffer_duration_ms(&self) -> u64 {
+        pcm_duration_ms(&self.buffer.lock())
+    }
+
     async fn transcribe_inner(&self, pcm: &[u8]) -> Result<RawTranscript> {
         if self.api_key.trim().is_empty() {
             anyhow::bail!("MiMo API key missing");
@@ -80,7 +86,10 @@ impl MimoBatchASR {
         let wav = encode_wav_16k_mono(&samples);
         let body = mimo_chat_body(&self.model, &wav);
         let url = mimo_chat_completions_url(&self.base_url)?;
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(HTTP_REQUEST_TIMEOUT)
+            .build()
+            .context("build MiMo ASR HTTP client")?;
         let resp = client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key.trim()))
@@ -313,6 +322,18 @@ mod tests {
             }]
         });
         assert_eq!(extract_mimo_text(&json), "你好MiMo");
+    }
+
+    #[test]
+    fn buffer_duration_tracks_consumed_pcm() {
+        let asr = MimoBatchASR::new(
+            "key".to_string(),
+            DEFAULT_ENDPOINT.to_string(),
+            DEFAULT_MODEL.to_string(),
+        );
+        assert_eq!(asr.buffer_duration_ms(), 0);
+        asr.consume_pcm_chunk(&vec![0u8; 32_000]);
+        assert_eq!(asr.buffer_duration_ms(), 1_000);
     }
 
     #[tokio::test]

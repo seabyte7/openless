@@ -21,19 +21,22 @@ Use the project build script instead of calling `tauri build` directly:
 
 ```bash
 cd app
-INSTALL=0 ./scripts/build-mac.sh
+INSTALL=0 ./scripts/build-mac.sh  # .app + .dmg, no install
+./scripts/build-mac.sh app        # .app only, no install
+./scripts/build-mac.sh dmg        # .dmg only, no install
 ```
 
 Generated macOS artifacts:
 
 - `app/src-tauri/target/release/bundle/macos/OpenLess.app`
-- `app/src-tauri/target/release/bundle/dmg/OpenLess_1.1.0_aarch64.dmg`
+- `app/src-tauri/target/release/bundle/dmg/OpenLess_<version>_aarch64.dmg`
 
 For local install during development:
 
 ```bash
 cd app
 ./scripts/build-mac.sh
+INSTALL=1 ./scripts/build-mac.sh app
 ```
 
 ## Windows Build

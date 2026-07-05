@@ -262,9 +262,12 @@ npm ci
 # Dev: Vite at :1420 + Tauri shell
 npm run tauri dev
 
-# macOS release build (signs, installs, resets TCC)
-./scripts/build-mac.sh
-INSTALL=0 ./scripts/build-mac.sh   # build only, skip install
+# macOS release build (signs, verifies, optionally installs)
+./scripts/build-mac.sh              # .app + .dmg, then install
+INSTALL=0 ./scripts/build-mac.sh    # .app + .dmg, no install
+./scripts/build-mac.sh app          # .app only, no install
+./scripts/build-mac.sh dmg          # .dmg only, no install
+INSTALL=1 ./scripts/build-mac.sh app # .app only, then install
 
 # Rust type-check without a full compile
 cargo check --manifest-path src-tauri/Cargo.toml

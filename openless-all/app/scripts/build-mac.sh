@@ -5,8 +5,11 @@
 # 由 Tauri 在生成 .app 和 .dmg 前合入，避免上传的 DMG 仍是旧 Info.plist。
 #
 # 用法：在 app/ 目录下执行
-#     ./scripts/build-mac.sh           # 构建 + 签名 + 装到 /Applications
-#     INSTALL=0 ./scripts/build-mac.sh # 只构建，不装
+#     ./scripts/build-mac.sh              # 构建 .app + .dmg，签名校验，并装到 /Applications
+#     INSTALL=0 ./scripts/build-mac.sh    # 构建 .app + .dmg，不安装
+#     ./scripts/build-mac.sh app          # 只构建 .app，不安装
+#     INSTALL=1 ./scripts/build-mac.sh app # 只构建 .app，并装到 /Applications
+#     ./scripts/build-mac.sh dmg          # 只构建 .dmg，不安装
 
 set -euo pipefail
 
@@ -15,7 +18,36 @@ cd "$(dirname "$0")/.."
 APP="src-tauri/target/release/bundle/macos/OpenLess.app"
 INFO="$APP/Contents/Info.plist"
 DMG_DIR="src-tauri/target/release/bundle/dmg"
-INSTALL="${INSTALL:-1}"
+PACKAGE="${1:-${PACKAGE:-all}}"
+if [ -z "${INSTALL+x}" ]; then
+  if [ "$PACKAGE" = "all" ]; then
+    INSTALL=1
+  else
+    INSTALL=0
+  fi
+fi
+
+case "$PACKAGE" in
+  all)
+    WANT_APP=1
+    WANT_DMG=1
+    BUNDLE_ARGS=()
+    ;;
+  app)
+    WANT_APP=1
+    WANT_DMG=0
+    BUNDLE_ARGS=(--bundles app)
+    ;;
+  dmg)
+    WANT_APP=0
+    WANT_DMG=1
+    BUNDLE_ARGS=(--bundles dmg)
+    ;;
+  *)
+    echo "用法：$0 [all|app|dmg]"
+    exit 2
+    ;;
+esac
 
 if [ -z "${APPLE_CERTIFICATE:-}" ] && [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
   export APPLE_SIGNING_IDENTITY="-"
@@ -24,8 +56,11 @@ else
   echo "▶ 检测到 Apple 签名环境，交给 Tauri 做 Developer ID 签名 / 公证"
 fi
 
-echo "▶ tauri build"
+echo "▶ tauri build ($PACKAGE)"
 TAURI_BUILD_ARGS=(build)
+if [ "${#BUNDLE_ARGS[@]}" -gt 0 ]; then
+  TAURI_BUILD_ARGS+=("${BUNDLE_ARGS[@]}")
+fi
 if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ] || [ -n "${TAURI_SIGNING_PRIVATE_KEY_PATH:-}" ]; then
   TAURI_BUILD_ARGS+=(--config '{"bundle":{"createUpdaterArtifacts":true}}')
 fi
@@ -40,21 +75,29 @@ echo "▶ 清理发布产物扩展属性"
 # 这只能保证 CI/本机构建产物本身干净；浏览器下载仍可能重新加 quarantine。
 # 用户免手工 xattr 的根本方案是 Developer ID 签名 + Apple notarization。
 xattr -cr "$APP" 2>/dev/null || true
-find "$DMG_DIR" -maxdepth 1 -name '*.dmg' -exec xattr -c {} \; 2>/dev/null || true
+if [ "$WANT_DMG" = "1" ] && [ -d "$DMG_DIR" ]; then
+  find "$DMG_DIR" -maxdepth 1 -name '*.dmg' -exec xattr -c {} \; 2>/dev/null || true
+fi
 
 echo "▶ 校验 quarantine 属性"
 if xattr -pr com.apple.quarantine "$APP" >/dev/null 2>&1; then
   echo "✗ $APP 仍包含 com.apple.quarantine"
   exit 1
 fi
-while IFS= read -r dmg; do
-  if xattr -p com.apple.quarantine "$dmg" >/dev/null 2>&1; then
-    echo "✗ $dmg 仍包含 com.apple.quarantine"
+if [ "$WANT_DMG" = "1" ]; then
+  if [ ! -d "$DMG_DIR" ] || ! find "$DMG_DIR" -maxdepth 1 -name '*.dmg' -print -quit | grep -q .; then
+    echo "✗ 未找到 DMG 产物：$DMG_DIR"
     exit 1
   fi
-done < <(find "$DMG_DIR" -maxdepth 1 -name '*.dmg' -print)
+  while IFS= read -r dmg; do
+    if xattr -p com.apple.quarantine "$dmg" >/dev/null 2>&1; then
+      echo "✗ $dmg 仍包含 com.apple.quarantine"
+      exit 1
+    fi
+  done < <(find "$DMG_DIR" -maxdepth 1 -name '*.dmg' -print)
+fi
 
-if [ "$INSTALL" = "1" ]; then
+if [ "$WANT_APP" = "1" ] && [ "$INSTALL" = "1" ]; then
   echo "▶ 装到 /Applications"
   pkill -f "OpenLess.app/Contents/MacOS/openless" 2>/dev/null || true
   sleep 1
@@ -67,4 +110,11 @@ if [ "$INSTALL" = "1" ]; then
   xattr -dr com.apple.quarantine /Applications/OpenLess.app 2>/dev/null || true
   echo "✓ 装好了：/Applications/OpenLess.app"
   echo "  打开方式：open /Applications/OpenLess.app"
+fi
+
+if [ "$WANT_APP" = "1" ]; then
+  echo "✓ APP 产物：$APP"
+fi
+if [ "$WANT_DMG" = "1" ]; then
+  echo "✓ DMG 产物目录：$DMG_DIR"
 fi

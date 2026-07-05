@@ -262,9 +262,12 @@ npm ci
 # 开发:Vite 运行于 :1420 + Tauri 外壳
 npm run tauri dev
 
-# macOS 发布构建(签名、安装、重置 TCC)
-./scripts/build-mac.sh
-INSTALL=0 ./scripts/build-mac.sh   # 仅构建,跳过安装
+# macOS 发布构建(签名、校验、可选安装)
+./scripts/build-mac.sh              # .app + .dmg,然后安装
+INSTALL=0 ./scripts/build-mac.sh    # .app + .dmg,不安装
+./scripts/build-mac.sh app          # 只构建 .app,不安装
+./scripts/build-mac.sh dmg          # 只构建 .dmg,不安装
+INSTALL=1 ./scripts/build-mac.sh app # 只构建 .app,然后安装
 
 # 不完整编译的 Rust 类型检查
 cargo check --manifest-path src-tauri/Cargo.toml

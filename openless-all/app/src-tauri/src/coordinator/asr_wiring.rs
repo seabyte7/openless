@@ -195,16 +195,34 @@ pub(super) fn emit_local_asr_engine_status(_inner: &Arc<Inner>) {}
 pub(super) fn schedule_local_asr_release(inner: &Arc<Inner>) {
     let keep_secs = inner.prefs.get().local_asr_keep_loaded_secs;
     let cache = Arc::clone(&inner.local_asr_cache);
-    if keep_secs == 0 {
-        cache.release_now();
-        emit_local_asr_engine_status(inner);
-        return;
-    }
+    let deferred_release = cache.has_deferred_release();
     let dur = std::time::Duration::from_secs(keep_secs as u64);
     let inner = Arc::clone(inner);
     tauri::async_runtime::spawn(async move {
+        if keep_secs == 0 || deferred_release {
+            for attempt in 0..20 {
+                if attempt == 0 {
+                    tokio::task::yield_now().await;
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                let outcome = cache.release_now();
+                if outcome.released() {
+                    emit_local_asr_engine_status(&inner);
+                    return;
+                }
+                if !matches!(
+                    outcome,
+                    crate::asr::local::cache::LocalAsrCacheReleaseOutcome::DeferredBusy
+                ) {
+                    return;
+                }
+            }
+            log::info!("[local-asr cache] deferred release remains busy after retry window");
+            return;
+        }
         tokio::time::sleep(dur).await;
-        if cache.release_if_idle(dur) {
+        if cache.release_if_idle(dur).released() {
             emit_local_asr_engine_status(&inner);
         }
     });

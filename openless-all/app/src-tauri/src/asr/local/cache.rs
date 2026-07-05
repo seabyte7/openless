@@ -33,6 +33,7 @@ struct CachedEngine {
     model_id: String,
     engine: Arc<QwenAsrEngine>,
     last_used: Instant,
+    deferred_release: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -40,6 +41,19 @@ struct CachedEngine {
 pub enum LocalAsrCacheOutcome {
     Reuse,
     Loaded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalAsrCacheReleaseOutcome {
+    Released,
+    DeferredBusy,
+    Skipped,
+}
+
+impl LocalAsrCacheReleaseOutcome {
+    pub fn released(self) -> bool {
+        matches!(self, LocalAsrCacheReleaseOutcome::Released)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -118,6 +132,7 @@ impl LocalAsrCache {
             model_id: model_id.to_string(),
             engine: Arc::clone(&engine),
             last_used: Instant::now(),
+            deferred_release: false,
         });
         log::info!("[local-asr cache] loaded {model_id}");
         Ok(LocalAsrEngineLoad {
@@ -137,48 +152,89 @@ impl LocalAsrCache {
         }
     }
 
-    /// 如果空闲时长 ≥ threshold，释放引擎。返回是否真释放了。
-    pub fn release_if_idle(&self, idle_threshold: Duration) -> bool {
+    /// 如果空闲时长 ≥ threshold，释放引擎；busy 时保留 cache slot 并标记延迟释放。
+    pub fn release_if_idle(&self, idle_threshold: Duration) -> LocalAsrCacheReleaseOutcome {
         #[cfg(target_os = "macos")]
         {
-            let taken = {
+            let release = {
                 let mut slot = self.inner.lock();
-                match slot.as_ref() {
-                    Some(c) if c.last_used.elapsed() >= idle_threshold => {
-                        log::info!(
-                            "[local-asr cache] release engine {} after idle {:?}",
-                            c.model_id,
-                            c.last_used.elapsed()
-                        );
-                        slot.take()
-                    }
-                    _ => None,
+                let Some(cached) = slot.as_mut() else {
+                    return LocalAsrCacheReleaseOutcome::Skipped;
+                };
+                let elapsed = cached.last_used.elapsed();
+                if elapsed < idle_threshold && !cached.deferred_release {
+                    return LocalAsrCacheReleaseOutcome::Skipped;
                 }
+                if cached_engine_is_busy(&cached.engine) {
+                    cached.deferred_release = true;
+                    log::info!(
+                        "[local-asr cache] defer release engine {} after idle {:?}: external_refs={}",
+                        cached.model_id,
+                        elapsed,
+                        cached_engine_external_ref_count(&cached.engine)
+                    );
+                    return LocalAsrCacheReleaseOutcome::DeferredBusy;
+                }
+                log::info!(
+                    "[local-asr cache] release engine {} after idle {:?}",
+                    cached.model_id,
+                    elapsed
+                );
+                slot.take()
             };
-            if let Some(cached) = taken {
-                drop(cached);
-                pressure_relief_macos();
-                return true;
+            if let Some(cached) = release {
+                release_cached_engine(cached);
+                return LocalAsrCacheReleaseOutcome::Released;
             }
         }
         let _ = idle_threshold;
-        false
+        LocalAsrCacheReleaseOutcome::Skipped
     }
 
     /// 立刻释放（用户点"立即释放"、切走 provider、删模型时调）。
-    pub fn release_now(&self) {
+    pub fn release_now(&self) -> LocalAsrCacheReleaseOutcome {
         #[cfg(target_os = "macos")]
         {
-            let taken = self.inner.lock().take();
-            if let Some(cached) = taken {
+            let release = {
+                let mut slot = self.inner.lock();
+                let Some(cached) = slot.as_mut() else {
+                    return LocalAsrCacheReleaseOutcome::Skipped;
+                };
+                if cached_engine_is_busy(&cached.engine) {
+                    cached.deferred_release = true;
+                    log::info!(
+                        "[local-asr cache] defer release engine {} on demand: external_refs={}",
+                        cached.model_id,
+                        cached_engine_external_ref_count(&cached.engine)
+                    );
+                    return LocalAsrCacheReleaseOutcome::DeferredBusy;
+                }
                 log::info!(
                     "[local-asr cache] release engine {} on demand",
                     cached.model_id
                 );
-                drop(cached);
-                pressure_relief_macos();
+                slot.take()
+            };
+            if let Some(cached) = release {
+                release_cached_engine(cached);
+                return LocalAsrCacheReleaseOutcome::Released;
             }
         }
+        LocalAsrCacheReleaseOutcome::Skipped
+    }
+
+    pub fn has_deferred_release(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            return self
+                .inner
+                .lock()
+                .as_ref()
+                .map(|cached| cached.deferred_release)
+                .unwrap_or(false);
+        }
+        #[cfg(not(target_os = "macos"))]
+        false
     }
 
     pub fn loaded_model_id(&self) -> Option<String> {
@@ -188,6 +244,50 @@ impl LocalAsrCache {
         }
         #[cfg(not(target_os = "macos"))]
         None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn release_cached_engine(cached: CachedEngine) {
+    drop(cached);
+    pressure_relief_macos();
+}
+
+#[cfg(target_os = "macos")]
+fn cached_engine_external_ref_count<T>(engine: &Arc<T>) -> usize {
+    Arc::strong_count(engine).saturating_sub(1)
+}
+
+#[cfg(target_os = "macos")]
+fn cached_engine_is_busy<T>(engine: &Arc<T>) -> bool {
+    cached_engine_external_ref_count(engine) > 0
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_busy_guard_tracks_external_engine_refs() {
+        let engine = Arc::new(());
+
+        assert_eq!(cached_engine_external_ref_count(&engine), 0);
+        assert!(!cached_engine_is_busy(&engine));
+
+        let active_worker_ref = Arc::clone(&engine);
+        assert_eq!(cached_engine_external_ref_count(&engine), 1);
+        assert!(cached_engine_is_busy(&engine));
+
+        drop(active_worker_ref);
+        assert_eq!(cached_engine_external_ref_count(&engine), 0);
+        assert!(!cached_engine_is_busy(&engine));
+    }
+
+    #[test]
+    fn cache_release_outcome_helper_identifies_released_only() {
+        assert!(LocalAsrCacheReleaseOutcome::Released.released());
+        assert!(!LocalAsrCacheReleaseOutcome::DeferredBusy.released());
+        assert!(!LocalAsrCacheReleaseOutcome::Skipped.released());
     }
 }
 

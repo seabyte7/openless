@@ -20,6 +20,8 @@ pub mod sherpa_runtime;
 pub mod test_run;
 
 pub use cache::LocalAsrCache;
+#[cfg(target_os = "macos")]
+pub use cache::LocalAsrCacheOutcome;
 #[allow(unused_imports)]
 pub use foundry_provider::FoundryLocalWhisperAsr;
 #[allow(unused_imports)]

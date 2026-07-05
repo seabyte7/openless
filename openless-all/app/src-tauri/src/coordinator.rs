@@ -2449,6 +2449,14 @@ mod tests {
     }
 
     #[test]
+    fn local_qwen_transcribe_timeout_filter_entrypoint() {
+        assert_eq!(
+            local_qwen_transcribe_timeout(60.0),
+            std::time::Duration::from_secs(46)
+        );
+    }
+
+    #[test]
     fn whisper_timeout_floors_at_global_timeout_for_short_audio() {
         // 10s 录音：10 × 0.5 = 5, +20 = 25, max(30) = 30。短音频兜底。
         assert_eq!(

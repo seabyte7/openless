@@ -35,6 +35,29 @@ struct CachedEngine {
     last_used: Instant,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalAsrCacheOutcome {
+    Reuse,
+    Loaded,
+}
+
+#[cfg(target_os = "macos")]
+impl LocalAsrCacheOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LocalAsrCacheOutcome::Reuse => "reuse",
+            LocalAsrCacheOutcome::Loaded => "loaded",
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub struct LocalAsrEngineLoad {
+    pub engine: Arc<QwenAsrEngine>,
+    pub outcome: LocalAsrCacheOutcome,
+}
+
 impl Default for LocalAsrCache {
     fn default() -> Self {
         Self::new()
@@ -55,13 +78,27 @@ impl LocalAsrCache {
     /// `spawn_blocking`）。模型 id 不同则把旧的 drop 再加载新的。
     #[cfg(target_os = "macos")]
     pub fn get_or_load(&self, model_id: &str, model_dir: &Path) -> Result<Arc<QwenAsrEngine>> {
+        Ok(self.get_or_load_with_status(model_id, model_dir)?.engine)
+    }
+
+    /// 与 `get_or_load` 相同，但额外返回本次是否复用缓存，供 dictation 基线日志
+    /// 区分模型加载时间和纯转写时间。
+    #[cfg(target_os = "macos")]
+    pub fn get_or_load_with_status(
+        &self,
+        model_id: &str,
+        model_dir: &Path,
+    ) -> Result<LocalAsrEngineLoad> {
         {
             let mut slot = self.inner.lock();
             if let Some(cached) = slot.as_mut() {
                 if cached.model_id == model_id {
                     cached.last_used = Instant::now();
                     log::info!("[local-asr cache] reuse engine: {model_id}");
-                    return Ok(Arc::clone(&cached.engine));
+                    return Ok(LocalAsrEngineLoad {
+                        engine: Arc::clone(&cached.engine),
+                        outcome: LocalAsrCacheOutcome::Reuse,
+                    });
                 }
                 log::info!(
                     "[local-asr cache] active model changed {} -> {}, drop old",
@@ -83,7 +120,10 @@ impl LocalAsrCache {
             last_used: Instant::now(),
         });
         log::info!("[local-asr cache] loaded {model_id}");
-        Ok(engine)
+        Ok(LocalAsrEngineLoad {
+            engine,
+            outcome: LocalAsrCacheOutcome::Loaded,
+        })
     }
 
     /// 标记最近使用时间——end_session 在调过 transcribe 之后调一下，

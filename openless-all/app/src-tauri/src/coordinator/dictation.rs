@@ -33,6 +33,45 @@ fn macos_keyless_dictation_provider(active_asr: &str) -> Option<MacosKeylessDict
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CoordTimingSnapshot {
+    recording_stop_ms: u64,
+    raw_asr_ms: u64,
+    llm_ms: Option<u64>,
+    insert_ms: u64,
+    stop_to_visible_ms: u64,
+}
+
+fn duration_to_ms(duration: std::time::Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn elapsed_ms_between(start: std::time::Instant, end: std::time::Instant) -> u64 {
+    duration_to_ms(end.saturating_duration_since(start))
+}
+
+fn optional_ms(value: Option<u64>) -> String {
+    value.map_or_else(|| "none".to_string(), |ms| ms.to_string())
+}
+
+fn coord_timing_snapshot(
+    session_started_at: std::time::Instant,
+    recording_stop_at: std::time::Instant,
+    asr_started_at: std::time::Instant,
+    raw_asr_completed_at: std::time::Instant,
+    llm_elapsed_ms: Option<u64>,
+    insert_started_at: std::time::Instant,
+    insert_completed_at: std::time::Instant,
+) -> CoordTimingSnapshot {
+    CoordTimingSnapshot {
+        recording_stop_ms: elapsed_ms_between(session_started_at, recording_stop_at),
+        raw_asr_ms: elapsed_ms_between(asr_started_at, raw_asr_completed_at),
+        llm_ms: llm_elapsed_ms,
+        insert_ms: elapsed_ms_between(insert_started_at, insert_completed_at),
+        stop_to_visible_ms: elapsed_ms_between(recording_stop_at, insert_completed_at),
+    }
+}
+
 /// Less Computer 浮窗的 Tauri 事件名（前端 LessComputerPanel 订阅）。
 const LESS_COMPUTER_EVENT: &str = "less-computer:event";
 
@@ -2091,7 +2130,8 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         session_id
     };
 
-    let elapsed = inner.state.lock().started_at.elapsed().as_millis() as u64;
+    let session_started_at = inner.state.lock().started_at;
+    let elapsed = elapsed_ms_between(session_started_at, std::time::Instant::now());
     let asr_started = std::time::Instant::now();
     emit_capsule_with_processing(
         inner,
@@ -2109,6 +2149,8 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         rec.stop();
         release_recording_mute(inner, "dictation");
     }
+    let recording_stop_at = std::time::Instant::now();
+    let recording_stop_elapsed_ms = elapsed_ms_between(session_started_at, recording_stop_at);
 
     let asr_opt = take_asr_for_session(inner, current_session_id);
     let asr = match asr_opt {
@@ -2329,14 +2371,38 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             // 可达 0.5；15s 固定超时在 ≥ 30s 录音上会把整段结果丢掉。改用动态
             // 超时 max(15, ceil(audio_s × 0.6) + 10)，公式与单测见
             // `local_qwen_transcribe_timeout`。
-            let audio_secs = (local.buffer_duration_ms() as f64) / 1000.0;
+            let audio_ms = local.buffer_duration_ms();
+            let audio_secs = (audio_ms as f64) / 1000.0;
             let timeout_duration = local_qwen_transcribe_timeout(audio_secs);
+            let model_id = local.model_id().to_string();
+            let engine_cache = local.engine_cache().as_str();
             log::info!(
                 "[coord] local Qwen3-ASR transcribe: audio={:.2}s timeout={}s",
                 audio_secs,
                 timeout_duration.as_secs()
             );
             let result = tokio::time::timeout(timeout_duration, local.transcribe()).await;
+            let local_asr_completed_at = std::time::Instant::now();
+            let stop_to_raw_ms = elapsed_ms_between(recording_stop_at, local_asr_completed_at);
+            let total_asr_ms = elapsed_ms_between(asr_started, local_asr_completed_at);
+            let status = match &result {
+                Ok(Ok(raw)) if raw.text.trim().is_empty() => "empty",
+                Ok(Ok(_)) => "ok",
+                Ok(Err(_)) => "error",
+                Err(_) => "timeout",
+            };
+            log::info!(
+                "[local-asr fast] session={} provider=local-qwen3 model={} engine_cache={} path=batch_stream audio_ms={} recording_stop_ms={} stop_to_raw_ms={} total_asr_ms={} timeout_ms={} fallback=none fallback_engine=none status={}",
+                current_session_id,
+                model_id,
+                engine_cache,
+                audio_ms,
+                recording_stop_elapsed_ms,
+                stop_to_raw_ms,
+                total_asr_ms,
+                timeout_duration.as_millis(),
+                status
+            );
             inner.local_asr_cache.touch();
             schedule_local_asr_release(inner);
             match result {
@@ -2447,6 +2513,7 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             }
         },
     };
+    let raw_asr_completed_at = std::time::Instant::now();
 
     // ASR 返回空转写护栏（来自 PR #66）：写一条 emptyTranscript 失败历史 + 错误胶囊，
     // 与 main 上其它 error 路径保持一致（带 schedule_capsule_idle 让胶囊自动消失）。
@@ -2763,6 +2830,7 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     let windows_insertion_mode = prefs.windows_insertion_mode;
     let paste_shortcut = prefs.paste_shortcut;
     // 流式路径下，字符已经通过 Unicode keystroke 落到光标处，跳过 inserter.insert。
+    let insert_started_at = std::time::Instant::now();
     let status = if already_streamed {
         log::info!(
             "[coord] insertion skipped: {} chars already streamed via unicode_keystroke (polish_error={:?})",
@@ -2846,8 +2914,30 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             }
         }
     };
+    let insert_completed_at = std::time::Instant::now();
     restore_prepared_windows_ime_session(inner, current_session_id);
     let inserted_chars = polished.chars().count() as u32;
+    let timing = coord_timing_snapshot(
+        session_started_at,
+        recording_stop_at,
+        asr_started,
+        raw_asr_completed_at,
+        llm_elapsed_ms,
+        insert_started_at,
+        insert_completed_at,
+    );
+    log::info!(
+        "[coord timing] session={} recording_stop_ms={} raw_asr_ms={} llm_ms={} insert_ms={} stop_to_visible_ms={} inserted_chars={} insert_status={:?} already_streamed={}",
+        current_session_id,
+        timing.recording_stop_ms,
+        timing.raw_asr_ms,
+        optional_ms(timing.llm_ms),
+        timing.insert_ms,
+        timing.stop_to_visible_ms,
+        inserted_chars,
+        status,
+        already_streamed
+    );
 
     // 累计每条 enabled 词条在最终文本中的命中次数。
     // 用 polished（最终插入的文本）扫描，与用户实际看到的输出一致。
@@ -3073,9 +3163,10 @@ fn eligible_polish_context_turns(
 mod tests {
     use super::{
         append_typed_prefix, asr_error_is_retryable, batch_asr_chunk_limit_ms,
-        build_transcribe_failed_session, default_done_message, drain_streaming_insert_deltas_with,
-        eligible_polish_context_turns, finalize_polished_text, flush_streaming_insert_buffer_with,
-        pcm_duration_ms, pcm_from_wav_bytes, streaming_insert_eligible,
+        build_transcribe_failed_session, coord_timing_snapshot, default_done_message,
+        drain_streaming_insert_deltas_with, eligible_polish_context_turns, finalize_polished_text,
+        flush_streaming_insert_buffer_with, pcm_duration_ms, pcm_from_wav_bytes,
+        streaming_insert_eligible,
     };
     #[cfg(target_os = "macos")]
     use super::{macos_keyless_dictation_provider, MacosKeylessDictationProvider};
@@ -3092,6 +3183,32 @@ mod tests {
             enabled: true,
             created_at: String::new(),
         }
+    }
+
+    #[test]
+    fn coord_timing_snapshot_splits_pipeline_durations() {
+        let start = std::time::Instant::now();
+        let recording_stop = start + std::time::Duration::from_millis(1_200);
+        let asr_start = start + std::time::Duration::from_millis(1_250);
+        let raw_asr_done = start + std::time::Duration::from_millis(2_800);
+        let insert_start = start + std::time::Duration::from_millis(3_700);
+        let insert_done = start + std::time::Duration::from_millis(3_950);
+
+        let timing = coord_timing_snapshot(
+            start,
+            recording_stop,
+            asr_start,
+            raw_asr_done,
+            Some(850),
+            insert_start,
+            insert_done,
+        );
+
+        assert_eq!(timing.recording_stop_ms, 1_200);
+        assert_eq!(timing.raw_asr_ms, 1_550);
+        assert_eq!(timing.llm_ms, Some(850));
+        assert_eq!(timing.insert_ms, 250);
+        assert_eq!(timing.stop_to_visible_ms, 2_750);
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -290,12 +290,26 @@ pub(super) async fn build_local_qwen3(
     // 1.2GB+ 模型。第一次加载阻塞数秒，spawn_blocking 不卡 tokio runtime。
     let cache = Arc::clone(&inner.local_asr_cache);
     let mid = model_id.as_str().to_string();
-    let engine = tauri::async_runtime::spawn_blocking(move || cache.get_or_load(&mid, &dir))
-        .await
-        .map_err(|e| anyhow::anyhow!("spawn_blocking join failed: {e:#}"))??;
+    let load_started = std::time::Instant::now();
+    let loaded =
+        tauri::async_runtime::spawn_blocking(move || cache.get_or_load_with_status(&mid, &dir))
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn_blocking join failed: {e:#}"))??;
+    let load_ms = load_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    log::info!(
+        "[local-asr fast] provider=local-qwen3 model={} engine_cache={} event=engine_ready load_ms={}",
+        model_id.as_str(),
+        loaded.outcome.as_str(),
+        load_ms
+    );
     // 加载完成（含缓存命中刷新 last_used）后推一次状态，前端零轮询更新「已加载」。
     emit_local_asr_engine_status(inner);
-    Ok(Arc::new(crate::asr::local::LocalQwenAsr::new(app, engine)))
+    Ok(Arc::new(crate::asr::local::LocalQwenAsr::new(
+        app,
+        loaded.engine,
+        model_id.as_str().to_string(),
+        loaded.outcome,
+    )))
 }
 
 #[cfg(target_os = "macos")]

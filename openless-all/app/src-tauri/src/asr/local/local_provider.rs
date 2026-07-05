@@ -18,13 +18,15 @@ use parking_lot::Mutex;
 use tauri::{AppHandle, Emitter};
 
 #[cfg(target_os = "macos")]
-use super::QwenAsrEngine;
+use super::{LocalAsrCacheOutcome, QwenAsrEngine};
 #[cfg(target_os = "macos")]
 use crate::asr::RawTranscript;
 
 #[cfg(target_os = "macos")]
 pub struct LocalQwenAsr {
     engine: Arc<QwenAsrEngine>,
+    model_id: String,
+    engine_cache: LocalAsrCacheOutcome,
     /// 16-bit LE PCM 字节缓冲（recorder 推什么我们存什么），在 transcribe 时再
     /// 转 f32 喂给 C 端。一次会话最多几 MB，clone 一次成本可接受。
     buffer: Mutex<Vec<u8>>,
@@ -33,12 +35,27 @@ pub struct LocalQwenAsr {
 
 #[cfg(target_os = "macos")]
 impl LocalQwenAsr {
-    pub fn new(app: AppHandle, engine: Arc<QwenAsrEngine>) -> Self {
+    pub fn new(
+        app: AppHandle,
+        engine: Arc<QwenAsrEngine>,
+        model_id: String,
+        engine_cache: LocalAsrCacheOutcome,
+    ) -> Self {
         Self {
             engine,
+            model_id,
+            engine_cache,
             buffer: Mutex::new(Vec::new()),
             app,
         }
+    }
+
+    pub fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    pub fn engine_cache(&self) -> LocalAsrCacheOutcome {
+        self.engine_cache
     }
 
     /// 当前缓冲音频时长（毫秒）。Coordinator 在 transcribe() 调用前读取，

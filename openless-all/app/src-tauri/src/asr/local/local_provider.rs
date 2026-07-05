@@ -33,6 +33,7 @@ use uuid::Uuid;
 use super::{LocalAsrCacheOutcome, QwenAsrEngine};
 #[cfg(target_os = "macos")]
 use crate::asr::RawTranscript;
+use crate::types::{LocalAsrTokenPayload, LocalAsrTokenSource};
 
 #[cfg(target_os = "macos")]
 use super::qwen_engine::QwenLiveAudioSource;
@@ -61,6 +62,9 @@ pub enum LocalQwenSessionMode {
     },
     BatchOnly,
 }
+
+#[cfg(target_os = "macos")]
+pub type LocalQwenTokenSessionGate = Arc<dyn Fn(Uuid) -> bool + Send + Sync + 'static>;
 
 #[cfg(target_os = "macos")]
 impl Default for LocalQwenSessionMode {
@@ -92,6 +96,8 @@ pub struct LocalQwenAsr {
     buffer: Mutex<Vec<u8>>,
     live: Mutex<LocalQwenLiveController>,
     app: AppHandle,
+    token_gate: Option<LocalQwenTokenSessionGate>,
+    token_sequence: Arc<AtomicU64>,
 }
 
 #[cfg(target_os = "macos")]
@@ -122,6 +128,26 @@ impl LocalQwenAsr {
         engine_cache: LocalAsrCacheOutcome,
         mode: LocalQwenSessionMode,
     ) -> Self {
+        Self::new_with_mode_and_token_gate(
+            app,
+            engine,
+            model_id,
+            model_dir,
+            engine_cache,
+            mode,
+            None,
+        )
+    }
+
+    pub fn new_with_mode_and_token_gate(
+        app: AppHandle,
+        engine: Arc<QwenAsrEngine>,
+        model_id: String,
+        model_dir: PathBuf,
+        engine_cache: LocalAsrCacheOutcome,
+        mode: LocalQwenSessionMode,
+        token_gate: Option<LocalQwenTokenSessionGate>,
+    ) -> Self {
         Self {
             engine,
             model_id,
@@ -131,6 +157,8 @@ impl LocalQwenAsr {
             buffer: Mutex::new(Vec::new()),
             live: Mutex::new(LocalQwenLiveController::default()),
             app,
+            token_gate,
+            token_sequence: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -197,16 +225,16 @@ impl LocalQwenAsr {
         // f32 零值）作为收尾信号。`duration_ms` 仍按原始缓冲长度计算。
         samples_f32.extend(std::iter::repeat(0.0f32).take(BATCH_STREAM_TAIL_SILENCE_SAMPLES));
 
-        // 注册 token 回调：每个稳定 token 抛 `local-asr-token` 事件。
-        // capsule 前端按 sessionId 累积显示。
-        let app = self.app.clone();
+        let token_context = self.token_emit_context(LocalAsrTokenSource::Fallback);
         let engine = Arc::clone(&self.engine);
         let text = tauri::async_runtime::spawn_blocking(move || {
-            engine.transcribe_stream_with_handler(&samples_f32, move |piece: &str| {
-                if let Err(e) = app.emit("local-asr-token", piece.to_string()) {
-                    log::warn!("[local-asr] emit token failed: {e}");
-                }
-            })
+            if let Some(token_context) = token_context {
+                engine.transcribe_stream_with_handler(&samples_f32, move |piece: &str| {
+                    token_context.emit(piece);
+                })
+            } else {
+                engine.transcribe_stream_with_handler(&samples_f32, |_piece: &str| {})
+            }
         })
         .await
         .context("transcribe spawn_blocking join 失败")?
@@ -216,6 +244,91 @@ impl LocalQwenAsr {
         Ok(RawTranscript { text, duration_ms })
     }
 
+    fn token_emit_context(&self, source: LocalAsrTokenSource) -> Option<LocalQwenTokenEmitContext> {
+        self.mode
+            .live_session_id()
+            .map(|session_id| LocalQwenTokenEmitContext {
+                app: self.app.clone(),
+                session_id,
+                source,
+                sequence: Arc::clone(&self.token_sequence),
+                gate: self.token_gate.clone(),
+            })
+    }
+
+    fn token_emit_context_for_session(
+        &self,
+        session_id: Uuid,
+        source: LocalAsrTokenSource,
+    ) -> LocalQwenTokenEmitContext {
+        LocalQwenTokenEmitContext {
+            app: self.app.clone(),
+            session_id,
+            source,
+            sequence: Arc::clone(&self.token_sequence),
+            gate: self.token_gate.clone(),
+        }
+    }
+
+    fn next_token_payload(
+        session_id: Uuid,
+        source: LocalAsrTokenSource,
+        sequence: &AtomicU64,
+        piece: &str,
+    ) -> LocalAsrTokenPayload {
+        let sequence = sequence.fetch_add(1, Ordering::Relaxed) + 1;
+        LocalAsrTokenPayload::local_qwen3(session_id.to_string(), source, sequence, piece)
+    }
+
+    fn emit_token_payload(app: &AppHandle, payload: LocalAsrTokenPayload, log_context: &str) {
+        if let Err(e) = app.emit("local-asr-token", payload) {
+            log::warn!("[local-asr] emit {log_context} token failed: {e}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct LocalQwenTokenEmitContext {
+    app: AppHandle,
+    session_id: Uuid,
+    source: LocalAsrTokenSource,
+    sequence: Arc<AtomicU64>,
+    gate: Option<LocalQwenTokenSessionGate>,
+}
+
+#[cfg(target_os = "macos")]
+impl LocalQwenTokenEmitContext {
+    fn emit(&self, piece: &str) {
+        if !local_qwen_token_session_is_current(self.gate.as_deref(), self.session_id) {
+            return;
+        }
+        let payload =
+            LocalQwenAsr::next_token_payload(self.session_id, self.source, &self.sequence, piece);
+        LocalQwenAsr::emit_token_payload(&self.app, payload, self.source.as_log_context());
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn local_qwen_token_session_is_current(
+    gate: Option<&(dyn Fn(Uuid) -> bool + Send + Sync + 'static)>,
+    session_id: Uuid,
+) -> bool {
+    gate.map(|gate| gate(session_id)).unwrap_or(true)
+}
+
+#[cfg(target_os = "macos")]
+impl LocalAsrTokenSource {
+    fn as_log_context(self) -> &'static str {
+        match self {
+            LocalAsrTokenSource::Live => "live",
+            LocalAsrTokenSource::Fallback => "fallback",
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl LocalQwenAsr {
     async fn transcribe_live_mode(
         &self,
         pcm_bytes: Vec<u8>,
@@ -462,7 +575,8 @@ impl LocalQwenAsr {
 
         let worker_engine = Arc::clone(&self.engine);
         let worker_source = Arc::clone(&source);
-        let app = self.app.clone();
+        let token_context =
+            self.token_emit_context_for_session(session_id, LocalAsrTokenSource::Live);
         let (worker_result_tx, worker_result_rx) =
             sync_channel::<std::result::Result<String, LocalQwenLiveWorkerFailure>>(1);
         let started_at = Instant::now();
@@ -478,9 +592,7 @@ impl LocalQwenAsr {
                             let elapsed_ms =
                                 started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                             worker_progress_ms.store(elapsed_ms, Ordering::Relaxed);
-                            if let Err(e) = app.emit("local-asr-token", piece.to_string()) {
-                                log::warn!("[local-asr] emit live token failed: {e}");
-                            }
+                            token_context.emit(piece);
                         },
                     )
                 }));
@@ -1212,6 +1324,41 @@ mod tests {
         assert!(msg.contains("live_reason=finalize_timeout"));
         assert!(msg.contains("fallback_engine=fresh"));
         assert!(msg.contains("fallback engine failed"));
+    }
+
+    #[test]
+    fn local_qwen_token_gate_rejects_stale_sessions() {
+        let current = Uuid::from_u128(7);
+        let stale = Uuid::from_u128(8);
+        let gate: LocalQwenTokenSessionGate = Arc::new(move |session_id| session_id == current);
+
+        assert!(local_qwen_token_session_is_current(
+            Some(gate.as_ref()),
+            current
+        ));
+        assert!(!local_qwen_token_session_is_current(
+            Some(gate.as_ref()),
+            stale
+        ));
+        assert!(local_qwen_token_session_is_current(None, stale));
+    }
+
+    #[test]
+    fn local_qwen_token_payload_sequences_and_tags_live_source() {
+        let sequence = AtomicU64::new(0);
+        let session_id = Uuid::from_u128(7);
+
+        let first =
+            LocalQwenAsr::next_token_payload(session_id, LocalAsrTokenSource::Live, &sequence, "a");
+        let second =
+            LocalQwenAsr::next_token_payload(session_id, LocalAsrTokenSource::Live, &sequence, "b");
+
+        assert_eq!(first.session_id, session_id.to_string());
+        assert_eq!(first.provider, "local-qwen3");
+        assert_eq!(first.source, LocalAsrTokenSource::Live);
+        assert_eq!(first.sequence, 1);
+        assert_eq!(first.piece, "a");
+        assert_eq!(second.sequence, 2);
     }
 
     #[test]

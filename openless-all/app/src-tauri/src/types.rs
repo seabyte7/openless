@@ -2670,6 +2670,8 @@ pub enum CapsuleProcessingStage {
 #[serde(rename_all = "camelCase")]
 pub struct CapsulePayload {
     pub state: CapsuleState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub level: f32, // 0..1 RMS
     pub elapsed_ms: u64,
     pub message: Option<String>,
@@ -2690,6 +2692,59 @@ pub struct CapsulePayload {
     /// false，光条"点亮"进入正式录音态。只对 Recording 状态有意义。详见胶囊出现时序改造。
     #[serde(default)]
     pub warming: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum LocalAsrTokenSource {
+    Live,
+    Fallback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalAsrTokenPayload {
+    pub session_id: String,
+    pub provider: String,
+    pub source: LocalAsrTokenSource,
+    pub sequence: u64,
+    pub piece: String,
+}
+
+impl LocalAsrTokenPayload {
+    pub fn new(
+        session_id: impl Into<String>,
+        provider: impl Into<String>,
+        source: LocalAsrTokenSource,
+        sequence: u64,
+        piece: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            provider: provider.into(),
+            source,
+            sequence,
+            piece: piece.into(),
+        }
+    }
+
+    pub fn local_qwen3(
+        session_id: impl Into<String>,
+        source: LocalAsrTokenSource,
+        sequence: u64,
+        piece: impl Into<String>,
+    ) -> Self {
+        Self::new(session_id, "local-qwen3", source, sequence, piece)
+    }
+
+    pub fn sherpa_onnx(
+        session_id: impl Into<String>,
+        source: LocalAsrTokenSource,
+        sequence: u64,
+        piece: impl Into<String>,
+    ) -> Self {
+        Self::new(session_id, "sherpa-onnx", source, sequence, piece)
+    }
 }
 
 /// Snapshot of credentials read from vault — only what the UI needs to know
@@ -3123,6 +3178,40 @@ mod tests {
 
         assert_eq!(binding.effective_codes(), vec!["ControlRight".to_string()]);
         assert_eq!(binding.display_label(), "右 Control");
+    }
+
+    #[test]
+    fn local_asr_token_payload_serializes_session_aware_contract() {
+        let payload =
+            LocalAsrTokenPayload::local_qwen3("session-1", LocalAsrTokenSource::Live, 7, "hello");
+        let value = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(value["sessionId"], "session-1");
+        assert_eq!(value["provider"], "local-qwen3");
+        assert_eq!(value["source"], "live");
+        assert_eq!(value["sequence"], 7);
+        assert_eq!(value["piece"], "hello");
+    }
+
+    #[test]
+    fn capsule_payload_serializes_optional_session_id() {
+        let payload = CapsulePayload {
+            state: CapsuleState::Recording,
+            session_id: Some("session-1".to_string()),
+            level: 0.5,
+            elapsed_ms: 100,
+            message: None,
+            inserted_chars: None,
+            translation: false,
+            operating: false,
+            processing_stage: None,
+            asr_elapsed_ms: None,
+            llm_elapsed_ms: None,
+            warming: false,
+        };
+        let value = serde_json::to_value(payload).unwrap();
+
+        assert_eq!(value["sessionId"], "session-1");
     }
 
     #[cfg(target_os = "windows")]

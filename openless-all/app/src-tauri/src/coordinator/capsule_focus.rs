@@ -417,13 +417,14 @@ pub(super) fn emit_capsule_with_processing(
     let app_opt = inner.app.lock().clone();
     let Some(app) = app_opt else { return };
     let translation = inner.translation_modifier_seen.load(Ordering::SeqCst);
-    let operating = inner.state.lock().voice_agent;
+    let (operating, session_id) = capsule_session_context(inner);
     // 预备态只对 Recording 有意义：麦克风还没吐第一帧 PCM 时（capsule_warming=true）把
     // warming 打成 true，前端渲染「待命」光效；level_handler 首触发后翻 false → 光条点亮。
     let warming = matches!(state, CapsuleState::Recording)
         && inner.capsule_warming.load(Ordering::SeqCst);
     let payload = CapsulePayload {
         state,
+        session_id,
         level,
         elapsed_ms,
         message,
@@ -633,6 +634,16 @@ pub(super) fn emit_capsule_with_processing(
     // Linux 上胶囊隐藏时提示音仍应工作，所以同时发给 main 窗口。始终即时，与胶囊窗口
     // 显示时机解耦。
     let _ = app.emit_to("main", "capsule:state", &payload);
+}
+
+fn capsule_session_context(inner: &Arc<Inner>) -> (bool, Option<String>) {
+    let state = inner.state.lock();
+    let session_id = if matches!(state.phase, SessionPhase::Idle) {
+        None
+    } else {
+        Some(state.session_id.to_string())
+    };
+    (state.voice_agent, session_id)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

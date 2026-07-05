@@ -1375,8 +1375,8 @@ pub(super) async fn begin_session_as(
 
     // Windows sherpa-onnx-local：与 Foundry 同形分支，复用 Recorder /
     // ActiveAsr / start_recorder_and_enter_listening。offline 模型走 batch；
-    // online 模型在 provider 内部 worker 中边录边解码，并通过 local-asr-token
-    // 推 partial 给前端胶囊。
+    // online 模型在 provider 内部 worker 中边录边解码，并通过 session-aware
+    // local-asr-token payload 推 partial 给前端胶囊。
     #[cfg(target_os = "windows")]
     if sherpa::is_sherpa_onnx_local(&active_asr) {
         let prefs = inner.prefs.get();
@@ -1392,8 +1392,27 @@ pub(super) async fn begin_session_as(
             Some(language_hint)
         };
         let token_handler = inner.app.lock().clone().map(|app| {
+            let inner = Arc::downgrade(inner);
+            let session_id = current_session_id;
+            let sequence = Arc::new(AtomicU64::new(0));
             Arc::new(move |piece: String| {
-                if let Err(error) = app.emit("local-asr-token", piece) {
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                let current = {
+                    let state = inner.state.lock();
+                    state.session_id == session_id && !state.cancelled
+                };
+                if !current {
+                    return;
+                }
+                let payload = crate::types::LocalAsrTokenPayload::sherpa_onnx(
+                    session_id.to_string(),
+                    crate::types::LocalAsrTokenSource::Live,
+                    sequence.fetch_add(1, Ordering::Relaxed) + 1,
+                    piece,
+                );
+                if let Err(error) = app.emit("local-asr-token", payload) {
                     log::warn!("[sherpa-asr] emit token failed: {error}");
                 }
             }) as crate::asr::local::sherpa_provider::SherpaTokenHandler

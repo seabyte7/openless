@@ -529,6 +529,7 @@ export type CapsuleState =
 
 export interface CapsulePayload {
   state: CapsuleState;
+  sessionId?: string;
   level: number; // 0..1 RMS
   elapsedMs: number;
   message: string | null;

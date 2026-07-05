@@ -2471,6 +2471,39 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn local_qwen_token_gate_tracks_current_uncancelled_session() {
+        let coordinator = Coordinator::new();
+        let current = session_id(7);
+        let stale = session_id(8);
+        {
+            let mut state = coordinator.inner.state.lock();
+            state.session_id = current;
+            state.cancelled = false;
+        }
+
+        let gate = local_qwen_token_gate_for_mode(
+            &coordinator.inner,
+            crate::asr::local::LocalQwenSessionMode::DictationLive {
+                session_id: current,
+            },
+        )
+        .expect("dictation live mode should install a token gate");
+
+        assert!(gate(current));
+        assert!(!gate(stale));
+
+        coordinator.inner.state.lock().cancelled = true;
+        assert!(!gate(current));
+
+        assert!(local_qwen_token_gate_for_mode(
+            &coordinator.inner,
+            crate::asr::local::LocalQwenSessionMode::BatchOnly,
+        )
+        .is_none());
+    }
+
     #[test]
     fn whisper_timeout_floors_at_global_timeout_for_short_audio() {
         // 10s 录音：10 × 0.5 = 5, +20 = 25, max(30) = 30。短音频兜底。

@@ -321,14 +321,18 @@ async fn build_local_qwen3_with_mode(
     );
     // 加载完成（含缓存命中刷新 last_used）后推一次状态，前端零轮询更新「已加载」。
     emit_local_asr_engine_status(inner);
-    Ok(Arc::new(crate::asr::local::LocalQwenAsr::new_with_mode(
-        app,
-        loaded.engine,
-        model_id.as_str().to_string(),
-        model_dir,
-        loaded.outcome,
-        mode,
-    )))
+    let token_gate = local_qwen_token_gate_for_mode(inner, mode);
+    Ok(Arc::new(
+        crate::asr::local::LocalQwenAsr::new_with_mode_and_token_gate(
+            app,
+            loaded.engine,
+            model_id.as_str().to_string(),
+            model_dir,
+            loaded.outcome,
+            mode,
+            token_gate,
+        ),
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -336,6 +340,28 @@ pub(super) async fn build_local_qwen3(
     inner: &Arc<Inner>,
 ) -> anyhow::Result<Arc<crate::asr::local::LocalQwenAsr>> {
     build_local_qwen3_with_mode(inner, crate::asr::local::LocalQwenSessionMode::BatchOnly).await
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn local_qwen_token_gate_for_mode(
+    inner: &Arc<Inner>,
+    mode: crate::asr::local::LocalQwenSessionMode,
+) -> Option<crate::asr::local::LocalQwenTokenSessionGate> {
+    if !matches!(
+        mode,
+        crate::asr::local::LocalQwenSessionMode::DictationLive { .. }
+    ) {
+        return None;
+    }
+
+    let inner = Arc::downgrade(inner);
+    Some(Arc::new(move |session_id| {
+        let Some(inner) = inner.upgrade() else {
+            return false;
+        };
+        let state = inner.state.lock();
+        state.session_id == session_id && !state.cancelled
+    }))
 }
 
 #[cfg(target_os = "macos")]
@@ -524,13 +550,9 @@ pub(super) async fn build_qa_asr_start(
         } else {
             Some(language_hint)
         };
-        let token_handler = inner.app.lock().clone().map(|app| {
-            Arc::new(move |piece: String| {
-                if let Err(error) = app.emit("local-asr-token", piece) {
-                    log::warn!("[sherpa-asr] emit token failed: {error}");
-                }
-            }) as crate::asr::local::sherpa_provider::SherpaTokenHandler
-        });
+        // QA voice is intentionally batch-only / non-token-displaying in the
+        // first session-aware local token contract.
+        let token_handler = None;
         let local = SherpaOnnxAsr::new_for_model(
             Arc::clone(&inner.sherpa_onnx_runtime),
             model_alias,

@@ -63,6 +63,23 @@ export interface LocalAsrDownloadProgress {
     error: string | null
 }
 
+export type LocalAsrTokenSource = "live" | "fallback"
+
+export interface LocalAsrTokenPayload {
+    sessionId: string
+    provider: "local-qwen3" | "sherpa-onnx"
+    source: LocalAsrTokenSource
+    sequence: number
+    piece: string
+}
+
+export function shouldAcceptLocalAsrToken(
+    token: LocalAsrTokenPayload,
+    activeSessionId: string | null | undefined,
+): boolean {
+    return Boolean(activeSessionId && token.sessionId === activeSessionId)
+}
+
 export interface FoundryLocalAsrStatus {
     providerId: string
     available: boolean

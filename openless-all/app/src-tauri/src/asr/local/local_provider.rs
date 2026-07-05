@@ -52,6 +52,8 @@ const LIVE_FEEDER_CHANNEL_CAPACITY: usize = 64;
 const LIVE_CANCEL_JOIN_GRACE_MS: u64 = 1_000;
 #[cfg(target_os = "macos")]
 const LIVE_PROGRESS_STALL_MS: u64 = 3_000;
+#[cfg(all(target_os = "macos", any(debug_assertions, test)))]
+const LOCAL_QWEN_LIVE_DEBUG_ENV: &str = "OPENLESS_QWEN_LIVE_DEBUG";
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -481,6 +483,12 @@ impl LocalQwenAsr {
     }
 
     fn consume_pcm_chunk_live(&self, pcm: &[u8]) {
+        #[cfg(any(debug_assertions, test))]
+        if local_qwen_live_debug_scenario_is(LocalQwenLiveDebugScenario::DisableLive) {
+            self.buffer.lock().extend_from_slice(pcm);
+            return;
+        }
+
         let live_action = {
             let mut buffer = self.buffer.lock();
             buffer.extend_from_slice(pcm);
@@ -524,6 +532,17 @@ impl LocalQwenAsr {
         let Some(session_id) = self.mode.live_session_id() else {
             return;
         };
+
+        #[cfg(any(debug_assertions, test))]
+        if local_qwen_live_debug_scenario_is(LocalQwenLiveDebugScenario::StartFailure) {
+            log::warn!(
+                "[local-asr fast] session={} path=live event=start_failed reason=debug_force_start_failure env={}",
+                session_id,
+                LOCAL_QWEN_LIVE_DEBUG_ENV
+            );
+            self.mark_live_start_failed();
+            return;
+        }
 
         let source = match QwenLiveAudioSource::create() {
             Ok(source) => Arc::new(source),
@@ -577,6 +596,8 @@ impl LocalQwenAsr {
         let worker_source = Arc::clone(&source);
         let token_context =
             self.token_emit_context_for_session(session_id, LocalAsrTokenSource::Live);
+        #[cfg(any(debug_assertions, test))]
+        let debug_scenario = local_qwen_live_debug_scenario();
         let (worker_result_tx, worker_result_rx) =
             sync_channel::<std::result::Result<String, LocalQwenLiveWorkerFailure>>(1);
         let started_at = Instant::now();
@@ -585,6 +606,24 @@ impl LocalQwenAsr {
         let worker_handle = match thread::Builder::new()
             .name("openless-qwen-live-worker".into())
             .spawn(move || {
+                #[cfg(any(debug_assertions, test))]
+                match debug_scenario {
+                    Some(LocalQwenLiveDebugScenario::InvalidFinal) => {
+                        let _ = worker_result_tx.send(Ok("   ".to_string()));
+                        return;
+                    }
+                    Some(LocalQwenLiveDebugScenario::HardStall) => {
+                        let _keep_engine_busy = Arc::clone(&worker_engine);
+                        thread::sleep(Duration::from_millis(LIVE_CANCEL_JOIN_GRACE_MS + 2_000));
+                        let _ = worker_result_tx.send(Err(LocalQwenLiveWorkerFailure::new(
+                            LocalQwenLiveFallbackReason::WorkerJoinError,
+                            "debug forced live worker hard-stall finished late",
+                        )));
+                        return;
+                    }
+                    _ => {}
+                }
+
                 let worker_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     worker_engine.transcribe_stream_live_with_handler(
                         &worker_source,
@@ -631,6 +670,16 @@ impl LocalQwenAsr {
             last_progress_ms,
         });
         live.machine.on_live_worker_started();
+        #[cfg(any(debug_assertions, test))]
+        if local_qwen_live_debug_scenario_is(LocalQwenLiveDebugScenario::FeederOverflow) {
+            log::warn!(
+                "[local-asr fast] session={} path=live event=fallback_needed reason=debug_force_feeder_overflow env={}",
+                session_id,
+                LOCAL_QWEN_LIVE_DEBUG_ENV
+            );
+            live.machine
+                .on_unhealthy(LocalQwenLiveFallbackReason::FeederOverflow);
+        }
     }
 
     fn mark_live_fallback_needed(&self, reason: LocalQwenLiveFallbackReason) {
@@ -733,6 +782,23 @@ fn finalize_live_runtime(
     }
 
     runtime.source.finish();
+    #[cfg(any(debug_assertions, test))]
+    if local_qwen_live_debug_scenario_is(LocalQwenLiveDebugScenario::FinalizeTimeout) {
+        log::warn!(
+            "[local-asr fast] path=live event=fallback_needed reason=debug_force_finalize_timeout env={}",
+            LOCAL_QWEN_LIVE_DEBUG_ENV
+        );
+        return fallback_after_live_cancel(runtime, LocalQwenLiveFallbackReason::FinalizeTimeout);
+    }
+    #[cfg(any(debug_assertions, test))]
+    if local_qwen_live_debug_scenario_is(LocalQwenLiveDebugScenario::HardStall) {
+        log::warn!(
+            "[local-asr fast] path=live event=fallback_needed reason=debug_force_hard_stall env={}",
+            LOCAL_QWEN_LIVE_DEBUG_ENV
+        );
+        return fallback_after_live_cancel(runtime, LocalQwenLiveFallbackReason::ProgressStall);
+    }
+
     let finalize_timeout = live_finalize_timeout(audio_secs);
     let progress_stall_timeout = live_progress_stall_timeout(finalize_timeout);
     let finalize_started_ms = runtime
@@ -1195,6 +1261,53 @@ fn i16_le_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+#[cfg(all(target_os = "macos", any(debug_assertions, test)))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalQwenLiveDebugScenario {
+    DisableLive,
+    StartFailure,
+    FinalizeTimeout,
+    HardStall,
+    InvalidFinal,
+    FeederOverflow,
+}
+
+#[cfg(all(target_os = "macos", any(debug_assertions, test)))]
+fn local_qwen_live_debug_scenario() -> Option<LocalQwenLiveDebugScenario> {
+    std::env::var(LOCAL_QWEN_LIVE_DEBUG_ENV)
+        .ok()
+        .and_then(|value| parse_local_qwen_live_debug_scenario(&value))
+}
+
+#[cfg(all(target_os = "macos", any(debug_assertions, test)))]
+fn local_qwen_live_debug_scenario_is(scenario: LocalQwenLiveDebugScenario) -> bool {
+    local_qwen_live_debug_scenario() == Some(scenario)
+}
+
+#[cfg(all(target_os = "macos", any(debug_assertions, test)))]
+fn parse_local_qwen_live_debug_scenario(value: &str) -> Option<LocalQwenLiveDebugScenario> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "disable-live" | "disable_live" | "disablelive" => {
+            Some(LocalQwenLiveDebugScenario::DisableLive)
+        }
+        "start-failure" | "start_failure" | "startfail" | "start-fail" => {
+            Some(LocalQwenLiveDebugScenario::StartFailure)
+        }
+        "finalize-timeout" | "finalize_timeout" | "timeout" => {
+            Some(LocalQwenLiveDebugScenario::FinalizeTimeout)
+        }
+        "hard-stall" | "hard_stall" | "hardstall" => Some(LocalQwenLiveDebugScenario::HardStall),
+        "invalid-final" | "invalid_final" | "invalid" => {
+            Some(LocalQwenLiveDebugScenario::InvalidFinal)
+        }
+        "feeder-overflow" | "feeder_overflow" | "overflow" => {
+            Some(LocalQwenLiveDebugScenario::FeederOverflow)
+        }
+        "" | "0" | "off" | "false" => None,
+        _ => None,
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
@@ -1273,6 +1386,42 @@ mod tests {
             machine.on_stop(),
             LocalQwenStopAction::FallbackNeeded(LocalQwenLiveFallbackReason::LiveStartFailed)
         );
+    }
+
+    #[test]
+    fn local_qwen_live_debug_scenario_parser_accepts_forced_fallback_knobs() {
+        assert_eq!(
+            parse_local_qwen_live_debug_scenario("disable-live"),
+            Some(LocalQwenLiveDebugScenario::DisableLive)
+        );
+        assert_eq!(
+            parse_local_qwen_live_debug_scenario("start_failure"),
+            Some(LocalQwenLiveDebugScenario::StartFailure)
+        );
+        assert_eq!(
+            parse_local_qwen_live_debug_scenario("timeout"),
+            Some(LocalQwenLiveDebugScenario::FinalizeTimeout)
+        );
+        assert_eq!(
+            parse_local_qwen_live_debug_scenario("hard-stall"),
+            Some(LocalQwenLiveDebugScenario::HardStall)
+        );
+        assert_eq!(
+            parse_local_qwen_live_debug_scenario("invalid"),
+            Some(LocalQwenLiveDebugScenario::InvalidFinal)
+        );
+        assert_eq!(
+            parse_local_qwen_live_debug_scenario("overflow"),
+            Some(LocalQwenLiveDebugScenario::FeederOverflow)
+        );
+    }
+
+    #[test]
+    fn local_qwen_live_debug_scenario_parser_ignores_disabled_or_unknown_values() {
+        assert_eq!(parse_local_qwen_live_debug_scenario(""), None);
+        assert_eq!(parse_local_qwen_live_debug_scenario("off"), None);
+        assert_eq!(parse_local_qwen_live_debug_scenario("false"), None);
+        assert_eq!(parse_local_qwen_live_debug_scenario("not-a-scenario"), None);
     }
 
     #[test]

@@ -126,6 +126,17 @@ Implementation should include debug-only validation controls or test hooks to si
 - live returns empty/invalid final text
 - live worker panic/join error where feasible
 
+For debug/test builds, use `OPENLESS_QWEN_LIVE_DEBUG` with exactly one value per app run:
+
+- `disable-live`: keep buffering full PCM and skip live startup, for direct-final comparison.
+- `start-failure`: force live startup failure and verify cached fallback.
+- `finalize-timeout` or `timeout`: force stop-time finalize timeout and verify fallback.
+- `hard-stall`: keep the cached live worker busy beyond cancel grace and verify fresh-engine fallback or clear both-path failure.
+- `invalid-final` or `invalid`: force whitespace live final and verify invalid-result fallback.
+- `feeder-overflow` or `overflow`: force the live path unhealthy as if the feeder was saturated, while preserving the full PCM buffer.
+
+These controls must stay out of user settings and release-only behavior.
+
 For each case, verify:
 
 - fallback trigger is logged with reason.

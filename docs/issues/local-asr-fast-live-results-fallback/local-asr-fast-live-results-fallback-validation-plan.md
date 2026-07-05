@@ -1,6 +1,6 @@
 # 本地 ASR 快速出结果与兜底机制 Validation Plan
 
-Status: draft
+Status: confirmed
 Requirements: docs/issues/local-asr-fast-live-results-fallback/local-asr-fast-live-results-fallback-requirements.md
 Technical spec: docs/issues/local-asr-fast-live-results-fallback/local-asr-fast-live-results-fallback-technical-spec.md
 Development plan: docs/issues/local-asr-fast-live-results-fallback/local-asr-fast-live-results-fallback-development-plan.md

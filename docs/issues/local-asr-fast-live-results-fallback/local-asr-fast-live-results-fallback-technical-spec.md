@@ -3,6 +3,7 @@
 Status: confirmed
 Requirements: docs/issues/local-asr-fast-live-results-fallback/local-asr-fast-live-results-fallback-requirements.md
 Artifact: docs/issues/local-asr-fast-live-results-fallback/local-asr-fast-live-results-fallback-technical-spec.md
+Implementation notes: docs/issues/local-asr-fast-live-results-fallback/local-asr-fast-live-results-fallback-implementation-notes.md
 
 ## Summary
 

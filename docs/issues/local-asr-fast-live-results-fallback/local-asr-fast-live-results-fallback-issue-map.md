@@ -7,6 +7,7 @@ Source requirements: docs/issues/local-asr-fast-live-results-fallback/local-asr-
 Source technical spec: docs/issues/local-asr-fast-live-results-fallback/local-asr-fast-live-results-fallback-technical-spec.md
 Source development plan: docs/issues/local-asr-fast-live-results-fallback/local-asr-fast-live-results-fallback-development-plan.md
 Source validation plan: docs/issues/local-asr-fast-live-results-fallback/local-asr-fast-live-results-fallback-validation-plan.md
+Implementation notes: docs/issues/local-asr-fast-live-results-fallback/local-asr-fast-live-results-fallback-implementation-notes.md
 
 ## Publishing Status
 

@@ -11,6 +11,7 @@ pub struct LocalAsrSettings {
     pub provider_id: String,
     pub active_model: String,
     pub mirror: String,
+    pub keep_loaded_secs: u32,
     pub models_base_dir: Option<String>,
     pub models_root_dir: String,
     /// macOS 才编入引擎；Windows 端 UI 需要据此把"开始下载"按钮灰掉。
@@ -28,6 +29,7 @@ pub fn local_asr_get_settings(coord: CoordinatorState<'_>) -> LocalAsrSettings {
         provider_id: LOCAL_PROVIDER_ID.into(),
         active_model: prefs.local_asr_active_model,
         mirror: prefs.local_asr_mirror,
+        keep_loaded_secs: prefs.local_asr_keep_loaded_secs,
         models_base_dir,
         models_root_dir,
         engine_available: cfg!(target_os = "macos"),
@@ -41,6 +43,16 @@ fn non_empty_string(value: String) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn set_active_qwen_model_pref(prefs: &mut crate::types::UserPreferences, model_id: String) {
+    prefs.local_asr_active_model = model_id;
+}
+
+fn set_local_asr_keep_loaded_secs_pref(prefs: &mut crate::types::UserPreferences, seconds: u32) {
+    prefs.local_asr_keep_loaded_secs = seconds;
+    prefs.foundry_local_asr_keep_loaded_secs = seconds;
+    prefs.sherpa_onnx_keep_loaded_secs = seconds;
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -172,7 +184,7 @@ pub fn local_asr_set_active_model(
         return Err(format!("unknown model id: {model_id}"));
     }
     let mut prefs = coord.prefs().get();
-    prefs.local_asr_active_model = model_id;
+    set_active_qwen_model_pref(&mut prefs, model_id);
     coord.prefs().set(prefs).map_err(|e| e.to_string())
 }
 
@@ -304,8 +316,47 @@ pub fn local_asr_set_keep_loaded_secs(
     seconds: u32,
 ) -> Result<(), String> {
     let mut prefs = coord.prefs().get();
-    prefs.local_asr_keep_loaded_secs = seconds;
+    set_local_asr_keep_loaded_secs_pref(&mut prefs, seconds);
     coord.prefs().set(prefs).map_err(|e| e.to_string())?;
     coord.emit_local_asr_engine_status();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setting_active_qwen_model_preserves_keep_loaded_preferences() {
+        let mut prefs = crate::types::UserPreferences {
+            local_asr_active_model: "qwen3-asr-0.6b".to_string(),
+            local_asr_keep_loaded_secs: 1800,
+            foundry_local_asr_keep_loaded_secs: 60,
+            sherpa_onnx_keep_loaded_secs: 86400,
+            ..crate::types::UserPreferences::default()
+        };
+
+        set_active_qwen_model_pref(&mut prefs, "qwen3-asr-1.7b".to_string());
+
+        assert_eq!(prefs.local_asr_active_model, "qwen3-asr-1.7b");
+        assert_eq!(prefs.local_asr_keep_loaded_secs, 1800);
+        assert_eq!(prefs.foundry_local_asr_keep_loaded_secs, 60);
+        assert_eq!(prefs.sherpa_onnx_keep_loaded_secs, 86400);
+    }
+
+    #[test]
+    fn setting_keep_loaded_secs_mirrors_legacy_engine_fields() {
+        let mut prefs = crate::types::UserPreferences {
+            local_asr_keep_loaded_secs: 60,
+            foundry_local_asr_keep_loaded_secs: 300,
+            sherpa_onnx_keep_loaded_secs: 86400,
+            ..crate::types::UserPreferences::default()
+        };
+
+        set_local_asr_keep_loaded_secs_pref(&mut prefs, 1800);
+
+        assert_eq!(prefs.local_asr_keep_loaded_secs, 1800);
+        assert_eq!(prefs.foundry_local_asr_keep_loaded_secs, 1800);
+        assert_eq!(prefs.sherpa_onnx_keep_loaded_secs, 1800);
+    }
 }

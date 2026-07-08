@@ -2539,9 +2539,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn local_asr_release_uses_canonical_keep_loaded_preference() {
+        let coordinator = Coordinator::new();
+        let mut prefs = coordinator.inner.prefs.get();
+        prefs.local_asr_keep_loaded_secs = 3;
+        prefs.foundry_local_asr_keep_loaded_secs = 7;
+        prefs.sherpa_onnx_keep_loaded_secs = 11;
+        coordinator.inner.prefs.set(prefs).unwrap();
+
+        assert_eq!(local_asr_release_keep_secs(&coordinator.inner), 3);
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
-    fn foundry_release_uses_foundry_keep_loaded_preference() {
+    fn foundry_release_uses_canonical_keep_loaded_preference() {
         let runtime = Arc::new(crate::asr::local::FoundryLocalRuntime::new());
         let coordinator = Coordinator::new_with_foundry_runtime(runtime);
         let mut prefs = coordinator.inner.prefs.get();
@@ -2549,7 +2561,20 @@ mod tests {
         prefs.foundry_local_asr_keep_loaded_secs = 7;
         coordinator.inner.prefs.set(prefs).unwrap();
 
-        assert_eq!(foundry_local_asr_release_keep_secs(&coordinator.inner), 7);
+        assert_eq!(foundry_local_asr_release_keep_secs(&coordinator.inner), 3);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn sherpa_release_uses_canonical_keep_loaded_preference() {
+        let runtime = Arc::new(crate::asr::local::FoundryLocalRuntime::new());
+        let coordinator = Coordinator::new_with_foundry_runtime(runtime);
+        let mut prefs = coordinator.inner.prefs.get();
+        prefs.local_asr_keep_loaded_secs = 3;
+        prefs.sherpa_onnx_keep_loaded_secs = 11;
+        coordinator.inner.prefs.set(prefs).unwrap();
+
+        assert_eq!(sherpa_onnx_release_keep_secs(&coordinator.inner), 3);
     }
 
     #[cfg(target_os = "windows")]

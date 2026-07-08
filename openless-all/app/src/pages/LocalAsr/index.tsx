@@ -185,6 +185,7 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
     >({})
     const [engineStatus, setEngineStatus] =
         useState<LocalAsrEngineStatus | null>(null)
+    const keepLoadedSecs = settings?.keepLoadedSecs ?? 300
     const refreshTimer = useRef<number | null>(null)
     const foundryRefreshTimer = useRef<number | null>(null)
     const sherpaRefreshTimer = useRef<number | null>(null)
@@ -1379,6 +1380,9 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
     const handleKeepLoadedChange = async (seconds: number) => {
         try {
             await setLocalAsrKeepLoadedSecs(seconds)
+            setSettings((current) =>
+                current ? { ...current, keepLoadedSecs: seconds } : current,
+            )
             await refresh()
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e))
@@ -2762,9 +2766,7 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                                         </div>
                                     </div>
                                     <select
-                                        value={
-                                            engineStatus?.keepLoadedSecs ?? 300
-                                        }
+                                        value={keepLoadedSecs}
                                         onChange={(e) =>
                                             void handleKeepLoadedChange(
                                                 Number(e.target.value),

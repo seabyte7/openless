@@ -193,7 +193,7 @@ pub(super) fn emit_local_asr_engine_status(_inner: &Arc<Inner>) {}
 /// 内存里的 Qwen3-ASR 引擎。0 = 立即释放；其它值 = sleep N 秒后看 last_used。
 /// 多次会话叠加多个 sleep 任务，每个独立 check：只要中间又被使用过就跳过释放。
 pub(super) fn schedule_local_asr_release(inner: &Arc<Inner>) {
-    let keep_secs = inner.prefs.get().local_asr_keep_loaded_secs;
+    let keep_secs = local_asr_release_keep_secs(inner);
     let cache = Arc::clone(&inner.local_asr_cache);
     let deferred_release = cache.has_deferred_release();
     let dur = std::time::Duration::from_secs(keep_secs as u64);
@@ -228,9 +228,13 @@ pub(super) fn schedule_local_asr_release(inner: &Arc<Inner>) {
     });
 }
 
+pub(super) fn local_asr_release_keep_secs(inner: &Arc<Inner>) -> u32 {
+    inner.prefs.get().local_asr_keep_loaded_secs
+}
+
 #[cfg(target_os = "windows")]
 pub(super) fn foundry_local_asr_release_keep_secs(inner: &Arc<Inner>) -> u32 {
-    inner.prefs.get().foundry_local_asr_keep_loaded_secs
+    local_asr_release_keep_secs(inner)
 }
 
 #[cfg(target_os = "windows")]
@@ -271,7 +275,7 @@ pub(super) fn schedule_foundry_local_asr_release(inner: &Arc<Inner>, session: As
 
 #[cfg(target_os = "windows")]
 pub(super) fn sherpa_onnx_release_keep_secs(inner: &Arc<Inner>) -> u32 {
-    inner.prefs.get().sherpa_onnx_keep_loaded_secs
+    local_asr_release_keep_secs(inner)
 }
 
 /// 与 `schedule_foundry_local_asr_release` 同形：session_id 老旧则不释放，

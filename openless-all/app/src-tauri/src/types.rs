@@ -764,7 +764,7 @@ pub struct UserPreferences {
     /// Windows Foundry Local Whisper 语言 hint。空字符串 = 自动检测。
     #[serde(default)]
     pub foundry_local_asr_language_hint: String,
-    /// Windows Foundry Local Whisper 模型在 runtime 中保持加载多久。
+    /// 旧版兼容字段；本地 ASR 释放策略统一以 local_asr_keep_loaded_secs 为准。
     #[serde(default = "default_local_asr_keep_loaded_secs")]
     pub foundry_local_asr_keep_loaded_secs: u32,
     /// Windows sherpa-onnx 本地 ASR 当前激活的模型 alias。
@@ -773,8 +773,7 @@ pub struct UserPreferences {
     /// Windows sherpa-onnx 语言 hint（BCP-47 / ISO 639-1 小写）。空 = 自动。
     #[serde(default)]
     pub sherpa_onnx_language_hint: String,
-    /// Windows sherpa-onnx 模型在 runtime 中保持加载多久（秒），语义与
-    /// foundry/qwen3 一致。
+    /// 旧版兼容字段；本地 ASR 释放策略统一以 local_asr_keep_loaded_secs 为准。
     #[serde(default = "default_local_asr_keep_loaded_secs")]
     pub sherpa_onnx_keep_loaded_secs: u32,
     /// Auto-update 渠道。stable = 后台自动更新查正式版 manifest；beta = 查 Beta manifest。
@@ -3075,6 +3074,27 @@ mod tests {
 
         let from_empty: UserPreferences = serde_json::from_str("{}").unwrap();
         assert_eq!(from_empty.paste_shortcut, PasteShortcut::CtrlV);
+    }
+
+    #[test]
+    fn local_asr_keep_loaded_legacy_fields_round_trip() {
+        let prefs: UserPreferences = serde_json::from_str(
+            r#"{
+                "localAsrKeepLoadedSecs": 1800,
+                "foundryLocalAsrKeepLoadedSecs": 60,
+                "sherpaOnnxKeepLoadedSecs": 86400
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(prefs.local_asr_keep_loaded_secs, 1800);
+        assert_eq!(prefs.foundry_local_asr_keep_loaded_secs, 60);
+        assert_eq!(prefs.sherpa_onnx_keep_loaded_secs, 86400);
+
+        let saved = serde_json::to_value(&prefs).unwrap();
+        assert_eq!(saved["localAsrKeepLoadedSecs"], 1800);
+        assert_eq!(saved["foundryLocalAsrKeepLoadedSecs"], 60);
+        assert_eq!(saved["sherpaOnnxKeepLoadedSecs"], 86400);
     }
 
     /// issue #440: 老版本会把默认 `streamingInsert:false` 写进 preferences.json。

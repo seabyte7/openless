@@ -13,10 +13,14 @@ const AUTO_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 const STARTUP_DELAY_MS = 4_000;
 
 export function AutoUpdateGate() {
-  const { prefs } = useHotkeySettings();
+  const { prefs, loading } = useHotkeySettings();
   const u = useAutoUpdate();
   const [platformCaps, setPlatformCaps] = useState<PlatformCapabilities | null>(null);
-  const enabled = (prefs?.autoUpdateCheck ?? true) && platformCaps?.supportsAutoUpdate === true;
+  // Do not infer an enabled preference before persisted settings have loaded.
+  // Otherwise a slow startup can begin a background check (and show its dialog)
+  // even when the stored autoUpdateCheck value is false.
+  const enabled =
+    !loading && prefs?.autoUpdateCheck === true && platformCaps?.supportsAutoUpdate === true;
 
   useEffect(() => {
     void getPlatformCapabilities().then(setPlatformCaps);

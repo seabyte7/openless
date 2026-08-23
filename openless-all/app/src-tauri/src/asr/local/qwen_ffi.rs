@@ -58,6 +58,11 @@ extern "C" {
         samples: *const f32,
         n_samples: c_int,
     ) -> c_int;
+    /// App 自有 shim（`csrc/openless_qwen_stream_config.c`），**不是** vendored
+    /// 库的导出符号。打开流式 past-text conditioning；不打开的话，`stream_impl`
+    /// 每个 chunk 会无文本前缀重解全文，产出重复与吞字。返回 0 成功 / -1 失败。
+    pub fn openless_qwen_enable_stream_past_text(ctx: *mut QwenCtx) -> c_int;
+
     pub fn qwen_live_audio_finish(live: *mut QwenLiveAudio);
     pub fn qwen_live_audio_cancel(live: *mut QwenLiveAudio);
     pub fn qwen_live_audio_free(live: *mut QwenLiveAudio);

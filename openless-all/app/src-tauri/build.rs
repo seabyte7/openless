@@ -84,6 +84,15 @@ fn build_qwen_asr_macos() {
     }
     println!("cargo:rerun-if-changed={}/qwen_asr.h", VENDOR);
 
+    // App 自有 shim：设置 vendored 库没有 setter 的流式参数（past-text
+    // conditioning）。编进同一个 libqwen_asr.a，符号自然可链接；`.include(VENDOR)`
+    // 已经把 qwen_asr.h 放在 include path 上，shim 里的 `#include "qwen_asr.h"`
+    // 可解析。取舍：它会跟着继承上面那串给三方代码用的 `-Wno-*` 和
+    // `.warnings(false)`；对一个几行的文件可以接受，不值得单开一个 cc::Build。
+    const APP_CSRC: &str = "csrc/openless_qwen_stream_config.c";
+    println!("cargo:rerun-if-changed={}", APP_CSRC);
+    build.file(APP_CSRC);
+
     build.compile("qwen_asr");
 
     // BLAS = Accelerate

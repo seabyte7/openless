@@ -221,22 +221,22 @@ impl LocalQwenAsr {
         duration_ms: u64,
     ) -> Result<RawTranscript> {
         let mut samples_f32 = i16_le_bytes_to_f32(&pcm_bytes);
-        // `transcribe_stream` 内部按 2s chunk 切片；末 chunk < 2s 且缓冲没有
-        // 静默尾巴时，C 引擎不会把它当作"语音已结束"，该 chunk 的转写结果
-        // 会被丢弃，导致末段内容消失。这里追加 0.5s 静默（@16kHz = 8000 个
-        // f32 零值）作为收尾信号。`duration_ms` 仍按原始缓冲长度计算。
+        // 追加 0.5s 静默（@16kHz = 8000 个 f32 零值）。原本是为 chunked 流式路径
+        // 加的收尾信号（末 chunk < 2s 且没有静默尾巴时会被 C 引擎丢弃）；现在这条
+        // 路径走整段离线精修，理由已不再成立，保留为无害的残留保险 —— 离线路径
+        // 本来就会把不足 0.5s 的片段补零到 0.5s。`duration_ms` 仍按原始缓冲长度
+        // 计算，不受这段静默影响。
         samples_f32.extend(std::iter::repeat(0.0f32).take(BATCH_STREAM_TAIL_SILENCE_SAMPLES));
 
-        let token_context = self.token_emit_context(LocalAsrTokenSource::Fallback);
+        // 这条路径只在 `transcribe()` 判定 `live_session_id().is_none()` 时进入，
+        // 而 `token_emit_context()` 正是 `live_session_id().map(...)` —— 所以这里
+        // 永远没有 token 消费者。之前却仍然注册了一个空回调，导致 C 侧
+        // `if (!ctx->token_cb && !live)` 的整段精修快速路径判假，白白走进 chunked
+        // 循环（那正是重复/吞字的来源）。`transcribe_stream_final` 会清空回调，
+        // 让 C 侧走单次全音频 transcribe_segment。
         let engine = Arc::clone(&self.engine);
         let text = tauri::async_runtime::spawn_blocking(move || {
-            if let Some(token_context) = token_context {
-                engine.transcribe_stream_with_handler(&samples_f32, move |piece: &str| {
-                    token_context.emit(piece);
-                })
-            } else {
-                engine.transcribe_stream_with_handler(&samples_f32, |_piece: &str| {})
-            }
+            engine.transcribe_stream_final(&samples_f32)
         })
         .await
         .context("transcribe spawn_blocking join 失败")?
@@ -244,18 +244,6 @@ impl LocalQwenAsr {
 
         self.buffer.lock().clear();
         Ok(RawTranscript { text, duration_ms })
-    }
-
-    fn token_emit_context(&self, source: LocalAsrTokenSource) -> Option<LocalQwenTokenEmitContext> {
-        self.mode
-            .live_session_id()
-            .map(|session_id| LocalQwenTokenEmitContext {
-                app: self.app.clone(),
-                session_id,
-                source,
-                sequence: Arc::clone(&self.token_sequence),
-                gate: self.token_gate.clone(),
-            })
     }
 
     fn token_emit_context_for_session(

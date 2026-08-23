@@ -12,10 +12,11 @@ use std::sync::{Mutex, MutexGuard};
 use anyhow::{Context, Result};
 
 use super::qwen_ffi::{
-    qwen_free, qwen_live_audio_append_f32, qwen_live_audio_append_s16le, qwen_live_audio_cancel,
-    qwen_live_audio_create, qwen_live_audio_finish, qwen_live_audio_free, qwen_load,
-    qwen_set_token_callback, qwen_transcribe_audio, qwen_transcribe_stream,
-    qwen_transcribe_stream_live, QwenCtx, QwenLiveAudio,
+    openless_qwen_enable_stream_past_text, qwen_free, qwen_live_audio_append_f32,
+    qwen_live_audio_append_s16le, qwen_live_audio_cancel, qwen_live_audio_create,
+    qwen_live_audio_finish, qwen_live_audio_free, qwen_load, qwen_set_token_callback,
+    qwen_transcribe_audio, qwen_transcribe_stream, qwen_transcribe_stream_live, QwenCtx,
+    QwenLiveAudio,
 };
 
 /// FnMut 闭包是 fat pointer，不能直接塞进 `*mut c_void`，所以包一层 Box。
@@ -129,6 +130,18 @@ impl QwenAsrEngine {
             anyhow::bail!("qwen_load 失败：{model_dir:?}");
         }
 
+        // vendored 库默认 past_text_conditioning=0，而 CLI 在 --stream 下强制置 1
+        // （vendor/qwen-asr/main.c）。不打开的话，stream_impl 每个 2s chunk 都会
+        // 无文本前缀地重解全文，撞上它 append-only 的提交逻辑 —— 表现为转写中间
+        // 重复整段、以及中段/尾部吞字。这里是全部三个引擎实例化点的唯一入口
+        // （cache.rs / local_provider.rs 的 fresh-engine 兜底 / test_run.rs）。
+        // SAFETY: `ctx` 刚由 qwen_load 返回且非空。
+        if unsafe { openless_qwen_enable_stream_past_text(ctx) } != 0 {
+            unsafe { qwen_free(ctx) };
+            anyhow::bail!("openless_qwen_enable_stream_past_text 失败：{model_dir:?}");
+        }
+        log::info!("[local-asr] stream past_text_conditioning=on (model_dir={model_dir:?})");
+
         Ok(Self {
             ctx,
             token_handler: Mutex::new(None),
@@ -158,6 +171,13 @@ impl QwenAsrEngine {
 
     /// 流式转写：内部按 2s chunk 切片，token 通过当前调用的 handler 实时吐出；
     /// 返回值是最终完整文本。
+    ///
+    /// ⚠️ 只在**真的有人消费 token** 时用它。注册 handler 会让 C 端的
+    /// `if (!ctx->token_cb && !live)` 整段精修快速路径判假，被迫走 chunked 循环
+    /// —— 那条路径的 append-only 提交在模型改写历史时会重复追加文本。曾经
+    /// `transcribe_batch_stream` 为一个空回调走了这里，导致 BatchOnly 转写出现
+    /// 重复与吞字。没有 token 消费者时请用 `transcribe_stream_final`。
+    #[allow(dead_code)]
     pub fn transcribe_stream_with_handler<F>(&self, samples: &[f32], handler: F) -> Result<String>
     where
         F: FnMut(&str) + Send + 'static,
@@ -169,7 +189,7 @@ impl QwenAsrEngine {
 
     /// no-token final path：清空 token callback 后调用 qwen_transcribe_stream。
     /// C 端在无 callback 且非 live 时会直接走 final refinement，不做 token pseudo-stream。
-    #[allow(dead_code)]
+    /// `transcribe_batch_stream`（BatchOnly：QA 热键 / voice agent）走这条。
     pub fn transcribe_stream_final(&self, samples: &[f32]) -> Result<String> {
         let _transcribe = self.begin_transcribe()?;
         let _token_guard = self.clear_token_handler_scoped();
